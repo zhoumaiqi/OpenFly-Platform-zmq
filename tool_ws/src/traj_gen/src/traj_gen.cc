@@ -7,7 +7,7 @@
 #include <unordered_map>
 #include <random>
 #include <cstdlib>
-
+#include <filesystem> 
 // ROS2 headers
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/qos.hpp>
@@ -34,6 +34,24 @@
 #include <yaml-cpp/yaml.h>
 #include <json/json.h>
 #include <nlohmann/json.hpp>
+
+namespace nlohmann {
+template <> 
+struct adl_serializer<Eigen::Vector3d> {
+    static void to_json(json& j, const Eigen::Vector3d& vec) {
+        j = json::array({vec.x(), vec.y(), vec.z()});
+    }
+
+    static void from_json(const json& j, Eigen::Vector3d& vec) {
+        vec.x() = j[0].get<double>();
+        vec.y() = j[1].get<double>();
+        vec.z() = j[2].get<double>();
+    }
+};
+} // namespace nlohmann
+
+
+
 
 // PCL
 #include <pcl/common/transforms.h>
@@ -388,7 +406,8 @@ public:
                 actionj["imageid"] = image_id;
                 actionj["type"] = action_list[i].first.first;
                 actionj["value"] = action_list[i].first.second;
-                actionj["pos"] = action_list[i].second;
+                actionj["pos"] = nlohmann::json(action_list[i].second);
+                //actionj["pos"] = action_list[i].second;
                 actionj["yaw"] = record_list[i][3];
                 j["action"] = actionj;
                 outputFile << j.dump(4) << std::endl; 
@@ -426,7 +445,8 @@ public:
             actionj["imageid"] = i;
             actionj["type"] = action_list[i].first.first;
             actionj["value"] = action_list[i].first.second;
-            actionj["pos"] = action_list[i].second;
+            //actionj["pos"] = action_list[i].second;
+            actionj["pos"] = nlohmann::json(action_list[i].second);
             actionj["yaw"] = record_list[i][3];
             j["action"] = actionj;
             outputFile << j.dump(4) << std::endl; // 每个 JSON 对象占一行

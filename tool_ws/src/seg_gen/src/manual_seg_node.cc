@@ -12,7 +12,7 @@
 #include <fstream>
 #include <memory>
 #include "loadpcdmap.hpp"
-
+#include <filesystem>
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
@@ -72,6 +72,7 @@ private:
     void pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
     {
 
+       
         nlohmann::ordered_json pose_data;
         pose_data["type"] = "building";
         pose_data["color"] = "test";

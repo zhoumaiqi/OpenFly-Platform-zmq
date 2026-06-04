@@ -7,16 +7,22 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_BUILD_TYPE "Release")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -fPIC")
 
+if(DEFINED ENV{CONDA_PREFIX})
+include_directories("$ENV{CONDA_PREFIX}/include")
+    message(STATUS "Using nlohmann-json from Conda: $ENV{CONDA_PREFIX}/include")
+endif()
+find_package(nlohmann_json  REQUIRED)
 find_package(ament_cmake REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(yaml-cpp REQUIRED) 
-find_package(nlohmann_json REQUIRED)
+
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(jsoncpp REQUIRED)
 
 include_directories(
   include
@@ -24,6 +30,11 @@ include_directories(
   ${EIGEN3_INCLUDE_DIRS} 
   ${PCL_INCLUDE_DIRS}
   ${OMPL_INCLUDE_DIRS}
+  ${YAML_CPP_INCLUDE_DIRS}
+  ${nlohmann_json_INCLUDE_DIRS}
+  ${JSONCPP_INCLUDE_DIRS}
+  /usr/include/jsoncpp
+  
 )
 
 link_directories(${PCL_LIBRARY_DIRS})
@@ -44,7 +55,7 @@ ament_target_dependencies(traj_gen_node
   nlohmann_json 
 )
 
-target_link_libraries(traj_gen_node jsoncpp glog nlohmann_json::nlohmann_json yaml-cpp)
+target_link_libraries(traj_gen_node  stdc++fs ${JSONCPP_LIBRARIES}  jsoncpp glog nlohmann_json::nlohmann_json yaml-cpp)
 
 install(TARGETS traj_gen_node
   DESTINATION lib/${PROJECT_NAME}

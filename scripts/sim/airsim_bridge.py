@@ -22,7 +22,7 @@ class AirsimBridge:
         self._sim_thread.start()
         time.sleep(10)
 
-        self._client = airsim.MultirotorClient()
+        self._client = airsim.MultirotorClient(ip="10.24.8.25", port=41451)
         self._client.confirmConnection()
         self._client.enableApiControl(True)
         self._client.armDisarm(True)

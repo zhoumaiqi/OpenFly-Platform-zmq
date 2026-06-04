@@ -26,7 +26,7 @@ thread_params:                                                         # Multi-t
     aim_port: 9999                                                     # The port that receives commands from the trajectory planner.
     listen_port: 9998                                                  # The port that receives commands from the simulator.
     sim_ip: "127.0.0.1"                                                # The IP address where the simulation is located can be local or other PCs within the local area network.
-    sim_port: 9000                                                     # The port for connecting to the simulation.
+    sim_port: 41452                                                    # The port for connecting to the AirSim RPC server.
     aimlandmark_nums: 1                                                # The number of destinations in a single trajectory.
     add_takeoff_land: true                                             # Whether to include takeoff and landing phases (not applicable in GS scenarios).
     with_turn: true                                                    # Whether to enforce mandatory turns within a trajectory segment.

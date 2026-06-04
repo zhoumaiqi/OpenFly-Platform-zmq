@@ -7,8 +7,9 @@ import yaml
 from pathlib import Path
 import os
 import sys
-sys.path.append(str(Path(__file__).parents[4]))
-print(str(Path(__file__).parents[4]))
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(PROJECT_ROOT))
+print(str(PROJECT_ROOT))
 from scripts.sim.common import *
 # from common import *
 import json
@@ -31,14 +32,16 @@ def get_next_sequence_number(save_dir, env_name):
     return max_seq_num + 1
 
 class AirsimBridge:  
-    def __init__(self, env_name):  
+    def __init__(self, env_name, sim_ip="127.0.0.1", sim_port=41451):  
         self.env_name = env_name
+        self.sim_ip = sim_ip
+        self.sim_port = sim_port
         self._sim_thread = threading.Thread(target=self._init_airsim_sim)
         self._sim_thread.start()
         time.sleep(10)
 
         self.global_point_cnt = 0
-        self._client = airsim.MultirotorClient()
+        self._client = airsim.MultirotorClient(ip=self.sim_ip, port=self.sim_port)
         self._client.confirmConnection()
         self._client.enableApiControl(True)
         self._client.armDisarm(True)
@@ -212,7 +215,11 @@ class AirsimBridge:
 
 def handle_planner(config_params, global_configs, type):
     env_name = global_configs['datagen']['env']
-    airsim_bridge = AirsimBridge(env_name)
+    airsim_bridge = AirsimBridge(
+        env_name,
+        sim_ip=config_params.get('sim_ip', '127.0.0.1'),
+        sim_port=config_params.get('sim_port', 41451),
+    )
     file_path = "tool_ws/src/pcd_gen/tmp_pcd_map/" if type == 'lidar' else 'image/'
     
 

@@ -25,8 +25,8 @@ thread_params:
     height_max: 50
     aim_port: 9999
     listen_port: 9998
-    sim_ip: "127.0.0.1"
-    sim_port: 9000
+    sim_ip: "10.24.8.25"
+    sim_port: 41451
     aimlandmark_nums: 1
     add_takeoff_land: true
     with_turn: true
