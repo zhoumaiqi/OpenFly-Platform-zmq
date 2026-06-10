@@ -46,7 +46,17 @@ class OurSPFAgent:
         self.image_dir = os.path.join(output_dir, "images")
         os.makedirs(self.image_dir, exist_ok=True)
 
-    def act(self, image, instruction, sample_id=None, step_id=None, pose=None, history=None):
+    def act(
+        self,
+        image,
+        instruction,
+        sample_id=None,
+        step_id=None,
+        pose=None,
+        history=None,
+        stage_plan=None,
+        active_stage=0,
+    ):
         del pose, history
         candidates = self._generate_candidate_points(image)
         input_overlay = self._draw_candidates(image, candidates)
@@ -59,7 +69,13 @@ class OurSPFAgent:
         parse_error = ""
         fallback_reason = ""
         try:
-            raw_response = self._call_vlm(input_overlay, instruction, candidates)
+            raw_response = self._call_vlm(
+                input_overlay,
+                instruction,
+                candidates,
+                stage_plan=stage_plan,
+                active_stage=active_stage,
+            )
             parsed = self._parse_response(raw_response)
         except Exception as exc:
             parse_error = str(exc)
@@ -70,6 +86,13 @@ class OurSPFAgent:
                 "target_visible": False,
                 "confidence": 0.0,
                 "reason": fallback_reason,
+                "observed_stage_id": -1,
+                "active_stage_target_visible": False,
+                "active_stage_target_centered": False,
+                "active_stage_target_close": False,
+                "active_stage_target_passed": False,
+                "stage_progress": "unclear",
+                "stage_complete_candidate": False,
             }
             fallback_used = True
 
@@ -84,6 +107,17 @@ class OurSPFAgent:
         target_visible = self._to_bool(parsed.get("target_visible", False))
         confidence = self._to_float(parsed.get("confidence", 0.0))
         reason = str(parsed.get("reason", ""))[:200]
+        observed_stage_id = self._to_int(parsed.get("observed_stage_id", -1), default=-1)
+        active_stage_target_visible = self._to_bool(
+            parsed.get("active_stage_target_visible", parsed.get("stage_target_visible", False))
+        )
+        active_stage_target_centered = self._to_bool(parsed.get("active_stage_target_centered", False))
+        active_stage_target_close = self._to_bool(parsed.get("active_stage_target_close", False))
+        active_stage_target_passed = self._to_bool(parsed.get("active_stage_target_passed", False))
+        stage_progress = str(parsed.get("stage_progress", "unclear")).strip().lower()
+        if stage_progress not in {"approaching", "near", "passed", "lost", "unclear"}:
+            stage_progress = "unclear"
+        stage_complete_candidate = self._to_bool(parsed.get("stage_complete_candidate", False))
         action_id = P_TO_ACTION_ID[choice]
 
         selected_overlay = self._draw_candidates(image, candidates, selected_id=choice)
@@ -103,6 +137,14 @@ class OurSPFAgent:
             "raw_response": raw_response,
             "input_image_path": input_image_path,
             "selected_image_path": selected_image_path,
+            "observed_stage_id": observed_stage_id,
+            "active_stage_target_visible": active_stage_target_visible,
+            "active_stage_target_centered": active_stage_target_centered,
+            "active_stage_target_close": active_stage_target_close,
+            "active_stage_target_passed": active_stage_target_passed,
+            "stage_target_visible": active_stage_target_visible,
+            "stage_progress": stage_progress,
+            "stage_complete_candidate": stage_complete_candidate,
         }
         if not fallback_used:
             print(
@@ -150,33 +192,89 @@ class OurSPFAgent:
             cv2.putText(annotated, candidate["id"], (x + 12, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         return annotated
 
-    def _call_vlm(self, image, instruction, candidates):
+    def _call_vlm(self, image, instruction, candidates, stage_plan=None, active_stage=0):
         image_url = self._image_to_data_url(image)
         candidate_lines = "\n".join(
             f'- {candidate["id"]}: [y, x] = {candidate["point"]}'
             for candidate in candidates
         )
+        stage_lines = self._format_stage_plan(stage_plan)
+        active_stage_info = self._format_active_stage(stage_plan, active_stage)
         system_prompt = (
             "You are a waypoint selection module. You must return only valid JSON. "
             "No explanations. No markdown. No reasoning."
         )
         prompt = (
             "Return ONLY one valid JSON object.\n"
-            "Do not explain. Do not use markdown. Do not include ```json code block.\n"
+            "Do not include Markdown.\n"
+            "Do not include analysis paragraphs.\n"
+            "Do not include explanation outside JSON.\n"
+            "Do not wrap JSON in code fences.\n"
+            "Use lowercase true/false.\n"
+            "All required keys must be present.\n"
             "Do not include task breakdown. Do not include reasoning.\n"
-            "Do not think step by step. Do not output analysis. Output final JSON only.\n"
+            "Output final JSON only.\n"
             "The first character must be { and the last character must be }.\n\n"
             "The image contains labeled candidate waypoints P1 to P15.\n"
             f"Task: {instruction}\n\n"
+            "You are given a full instruction decomposed into stages.\n"
+            f"active_stage: {active_stage}\n"
+            f"Stages:\n{stage_lines}\n\n"
+            f"Current active stage:\n{active_stage_info}\n\n"
+            "The following fields must be judged ONLY relative to the current active stage target:\n"
+            "- active_stage_target_visible\n"
+            "- active_stage_target_centered\n"
+            "- active_stage_target_close\n"
+            "- active_stage_target_passed\n"
+            "- stage_progress\n"
+            "- stage_complete_candidate\n\n"
+            "observed_stage_id can be different from active_stage, but it is only used to record which stage the current image visually resembles.\n\n"
             "Choose exactly one candidate that best moves the drone toward the task.\n"
             "Output format, exactly one object:\n"
-            "{\"choice\":\"P8\",\"target_visible\":true,\"confidence\":0.9,\"reason\":\"brief\"}\n\n"
+            "{\"choice\":\"P8\",\"target_visible\":true,\"confidence\":0.9,\"reason\":\"brief\","
+            "\"observed_stage_id\":0,\"active_stage_target_visible\":true,"
+            "\"active_stage_target_centered\":true,\"active_stage_target_close\":false,"
+            "\"active_stage_target_passed\":false,"
+            "\"stage_progress\":\"approaching\",\"stage_complete_candidate\":false}\n\n"
             f"Valid choices:\n{candidate_lines}\n\n"
             "Rules:\n"
             "- choice must be one of P1 through P15.\n"
             "- target_visible must be true or false.\n"
             "- confidence must be a number from 0.0 to 1.0.\n"
-            "- Keep reason under 12 words."
+            "- Keep reason under 12 words.\n"
+            "- observed_stage_id is visual evidence only: which stage the current image and selected waypoint best match.\n"
+            "- observed_stage_id must be based on visual evidence; do not simply copy active_stage; use -1 if unclear.\n"
+            "- observed_stage_id does not mean the task has progressed to that stage.\n"
+            "- active_stage_target_visible, active_stage_target_centered, active_stage_target_close, active_stage_target_passed, stage_progress, and stage_complete_candidate must all judge only the current active_stage target.\n"
+            "- Do not set active-stage fields true because observed_stage_id is a future stage.\n"
+            "- If active_stage=0, active_stage_target_visible is only about stage 0 even if observed_stage_id is 2.\n"
+            "- active_stage_target_centered means the active_stage target is near the image center or the selected waypoint clearly aims toward its center.\n"
+            "- active_stage_target_close does NOT mean already touched the target or reached the final goal.\n"
+            "- active_stage_target_close means the active_stage target has entered a near-before-stage-switch state.\n"
+            "- Set active_stage_target_close=true if the active-stage target is the main forward structure, occupies clear image area, or is no longer a tiny distant landmark.\n"
+            "- Set active_stage_target_close=true if the selected waypoint lies on the target building, its edge, its lower entrance area, or the street directly in front of it.\n"
+            "- Set active_stage_target_close=true if continuing forward will likely enter the target area or pass the target.\n"
+            "- Set active_stage_target_close=true if the target changed from distant direction cue into a nearby structure that may require turning, bypassing, or switching stage.\n"
+            "- Visible alone is not close, but if the target dominates the forward view or the waypoint lands on/near it, do not keep returning close=false.\n"
+            "- active_stage_target_passed means the active_stage target may already have been passed or current motion no longer clearly approaches it.\n"
+            "- Set active_stage_target_passed=true if the target moved from front/center to side, partly left the main view, or the waypoint points beyond/beside it or toward the next area.\n"
+            "- Set active_stage_target_passed=true if the image suggests the drone has passed the target facade/location or continuing forward moves away from it.\n"
+            "- If uncertain, use false for visible/centered/close/passed and unclear for progress.\n"
+            "- stage_progress must be relative to active_stage only and one of: approaching, near, passed, lost, unclear.\n"
+            "- approaching: active_stage target is still mainly a direction cue, distant, or not clearly near yet.\n"
+            "- near: active_stage target is a main visual structure, clearly larger/closer, or the waypoint lands on the target, its edge, lower area, or near-front street.\n"
+            "- near also applies when continuing current motion will likely reach or pass the active-stage target.\n"
+            "- passed: active_stage target appears already passed or behind/side-behind.\n"
+            "- lost: active_stage target was likely visible/clear before but is currently lost.\n"
+            "- unclear: not enough evidence.\n"
+            "- stage_complete_candidate must refer only to active_stage.\n"
+            "- Do not set stage_complete_candidate=true just because the target is visible.\n"
+            "- Do not set stage_complete_candidate=true just because the target is centered but still distant.\n"
+            "- Set stage_complete_candidate=true if active_stage_target_close=true and the waypoint is on or near the target building/area.\n"
+            "- Set stage_complete_candidate=true if stage_progress=near and the active-stage target is the main image structure.\n"
+            "- Set stage_complete_candidate=true if active_stage_target_passed=true.\n"
+            "- Set stage_complete_candidate=true if the active-stage target is close enough that the next stage should likely begin soon.\n"
+            "- If the active-stage target is only distant visible and centered, keep stage_complete_candidate=false."
         )
         payload = {
             "model": self.model_name,
@@ -211,6 +309,47 @@ class OurSPFAgent:
         response.raise_for_status()
         data = response.json()
         return data["choices"][0]["message"]["content"]
+
+    def _format_stage_plan(self, stage_plan):
+        if not stage_plan:
+            return "- no explicit stages"
+        lines = []
+        for stage in stage_plan:
+            lines.append(
+                "- {stage_id}: {stage_text} | landmark={landmark_phrase} | motion={motion_hint}".format(
+                    stage_id=stage.get("stage_id", ""),
+                    stage_text=stage.get("stage_text", ""),
+                    landmark_phrase=stage.get("landmark_phrase", ""),
+                    motion_hint=stage.get("motion_hint", ""),
+                )
+            )
+        return "\n".join(lines)
+
+    def _format_active_stage(self, stage_plan, active_stage):
+        stage = self._get_active_stage(stage_plan, active_stage)
+        if not stage:
+            return (
+                f"- stage_id: {active_stage}\n"
+                "- stage_text: unknown\n"
+                "- motion_hint: unknown\n"
+                "- target_landmark: unknown"
+            )
+        return (
+            f"- stage_id: {stage.get('stage_id', active_stage)}\n"
+            f"- stage_text: {stage.get('stage_text', '')}\n"
+            f"- motion_hint: {stage.get('motion_hint', '')}\n"
+            f"- target_landmark: {stage.get('landmark_phrase', stage.get('target_landmark', ''))}"
+        )
+
+    def _get_active_stage(self, stage_plan, active_stage):
+        if not stage_plan:
+            return None
+        for stage in stage_plan:
+            if stage.get("stage_id") == active_stage:
+                return stage
+        if 0 <= active_stage < len(stage_plan):
+            return stage_plan[active_stage]
+        return None
 
     def _image_to_data_url(self, image):
         ok, buffer = cv2.imencode(".jpg", image)
@@ -286,3 +425,9 @@ class OurSPFAgent:
             return float(value)
         except (TypeError, ValueError):
             return 0.0
+
+    def _to_int(self, value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default

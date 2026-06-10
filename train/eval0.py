@@ -23,6 +23,7 @@ import numpy as np
 import io
 import time
 import math
+import re
 import subprocess, threading
 import airsim
 from common import *
@@ -30,6 +31,7 @@ import psutil
 import requests
 import random
 from ours_spf_agent import OurSPFAgent
+from memory_graph import MemoryGraph
 
 
 
@@ -407,6 +409,8 @@ def convert_to_action_id(action):
 
 
 def action_id_to_name(action_id):
+    if action_id == "":
+        return ""
     action_names = {
         0: "stop",
         1: "forward_3",
@@ -420,6 +424,806 @@ def action_id_to_name(action_id):
         9: "forward_9",
     }
     return action_names.get(int(action_id), f"unknown_{action_id}")
+
+
+def pose_distance(pose_a, pose_b):
+    return math.sqrt(
+        (pose_a[0] - pose_b[0]) ** 2
+        + (pose_a[1] - pose_b[1]) ** 2
+        + (pose_a[2] - pose_b[2]) ** 2
+    )
+
+
+def yaw_delta_deg(yaw_a, yaw_b):
+    return abs((math.degrees(yaw_a) - math.degrees(yaw_b) + 180.0) % 360.0 - 180.0)
+
+
+def choice_group(choice):
+    choice = str(choice).upper()
+    if choice in {"P1", "P6", "P11"}:
+        return "left"
+    if choice in {"P5", "P10", "P15"}:
+        return "right"
+    if choice:
+        return "center"
+    return ""
+
+
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "y", "on"):
+        return True
+    if normalized in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected boolean value, got {value}")
+
+
+def memory_output_dir(base_dir, env_name, sample_id):
+    return os.path.join(base_dir, "memory_graphs", env_name, f"sample_{sample_id:04d}")
+
+
+STAGE_SPLIT_RE = re.compile(
+    r"\b(then|finally|next|after that|afterward|afterwards)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def extract_stage_plan(instruction):
+    parts = []
+    last = 0
+    for match in STAGE_SPLIT_RE.finditer(instruction):
+        prefix = instruction[last:match.start()].strip(" ,.;")
+        if prefix:
+            parts.append(prefix)
+        last = match.start()
+    tail = instruction[last:].strip(" ,.;")
+    if tail:
+        parts.append(tail)
+
+    stages = []
+    for idx, stage_text in enumerate(parts or [instruction]):
+        lower = stage_text.lower()
+        motion_hints = []
+        for word in ("left", "right", "straight", "forward", "up", "down", "turn"):
+            if word in lower:
+                motion_hints.append(word)
+        landmark_phrase = stage_text
+        for token in ("toward", "to", "until", "near"):
+            marker = f" {token} "
+            if marker in lower:
+                start = lower.find(marker) + len(marker)
+                landmark_phrase = stage_text[start:].strip(" ,.;")
+                break
+        stages.append(
+            {
+                "stage_id": idx,
+                "stage_text": stage_text,
+                "motion_hint": ", ".join(motion_hints),
+                "landmark_phrase": landmark_phrase,
+                "status": "pending",
+            }
+        )
+    return stages
+
+
+class StageMemoryTracker:
+    CLOSE_MEMORY_VALID_WINDOW = 3
+
+    def __init__(self, stage_plan):
+        self.stage_plan = stage_plan
+        self.active_stage = 0
+        self.recent_evidence = []
+        self.transitions = []
+        self.stage_stats = {}
+        for stage in stage_plan:
+            stage_id = stage["stage_id"]
+            self.stage_stats[stage_id] = {
+                "reliable_observed_count": 0,
+                "reliable_active_visible_count": 0,
+                "reliable_centered_count": 0,
+                "reliable_close_count": 0,
+                "reliable_passed_count": 0,
+                "consecutive_active_visible_count": 0,
+                "consecutive_centered_count": 0,
+                "consecutive_close_count": 0,
+                "consecutive_passed_count": 0,
+                "consecutive_complete_count": 0,
+                "consecutive_tracker_completion_count": 0,
+                "weak_completion_candidate_count": 0,
+                "tracker_completion_candidate_count": 0,
+                "recent_observed_stage_ids": [],
+                "recent_progress": [],
+                "transition_candidates": [],
+                "weak_transition_candidate_steps": [],
+                "transition_candidate_steps": [],
+                "ignored_fallback_count": 0,
+                "close_memory_activation_count": 0,
+                "close_memory_candidate_count": 0,
+                "close_memory_expired_count": 0,
+                "close_memory_cleared_count": 0,
+                "last_close_step": None,
+                "last_close_confidence": None,
+                "last_near_step": None,
+                "close_memory_active": False,
+                "close_memory_age": "",
+                "close_memory_source": "",
+                "close_memory_valid_window": self.CLOSE_MEMORY_VALID_WINDOW,
+                "close_memory_blocked_count": 0,
+                "stage_first_reliable_step": None,
+                "long_approach_candidate_count": 0,
+                "long_approach_candidate_steps": [],
+                "long_approach_max_score": 0,
+                "long_approach_first_step": None,
+                "long_approach_last_step": None,
+                "long_approach_confirmed_count": 0,
+                "long_approach_confirmed_steps": [],
+                "consecutive_long_approach_confirmed_count": 0,
+            }
+
+    def _close_memory_age(self, stats, step_id):
+        steps = [
+            value for value in (stats["last_close_step"], stats["last_near_step"])
+            if value is not None
+        ]
+        if not steps:
+            return ""
+        return step_id - max(steps)
+
+    def _activate_close_memory(self, stats, step_id, confidence, source):
+        if not stats["close_memory_active"]:
+            stats["close_memory_activation_count"] += 1
+        stats["close_memory_active"] = True
+        stats["close_memory_source"] = source
+        if source == "close_true":
+            stats["last_close_step"] = step_id
+            stats["last_close_confidence"] = confidence
+        elif source == "progress_near":
+            stats["last_near_step"] = step_id
+        elif source == "vlm_complete":
+            if stats["last_near_step"] is None:
+                stats["last_near_step"] = step_id
+
+    def _clear_close_memory(self, stats):
+        stats["close_memory_active"] = False
+        stats["close_memory_age"] = ""
+        stats["close_memory_source"] = ""
+
+    def _reset_stage_runtime_counts(self, stats):
+        stats["consecutive_active_visible_count"] = 0
+        stats["consecutive_centered_count"] = 0
+        stats["consecutive_close_count"] = 0
+        stats["consecutive_passed_count"] = 0
+        stats["consecutive_complete_count"] = 0
+        stats["consecutive_tracker_completion_count"] = 0
+        stats["consecutive_long_approach_confirmed_count"] = 0
+        stats["close_memory_active"] = False
+        stats["close_memory_age"] = ""
+        stats["close_memory_source"] = ""
+
+    def update(self, step_id, ours_info):
+        observed_stage_id = ours_info.get("observed_stage_id", -1)
+        active_stage_target_visible = bool(
+            ours_info.get("active_stage_target_visible", ours_info.get("stage_target_visible", False))
+        )
+        active_stage_target_centered = bool(ours_info.get("active_stage_target_centered", False))
+        active_stage_target_close = bool(ours_info.get("active_stage_target_close", False))
+        active_stage_target_passed = bool(ours_info.get("active_stage_target_passed", False))
+        stage_progress = ours_info.get("stage_progress", "unclear")
+        stage_complete_candidate = bool(ours_info.get("stage_complete_candidate", False))
+        confidence = float(ours_info.get("confidence", 0.0) or 0.0)
+        fallback_used = bool(ours_info.get("fallback_used", False))
+        evaluated_stage = self.active_stage
+        active_stats = self.stage_stats[self.active_stage]
+        reliable = not fallback_used and confidence >= 0.8
+        ignored_due_to_fallback = False
+        stage_memory_note = ""
+        weak_completion_candidate = False
+        weak_completion_reason = ""
+        tracker_completion_candidate = False
+        tracker_completion_reason = ""
+        close_memory_event_note = ""
+        long_approach_candidate = False
+        long_approach_reason = ""
+        long_approach_score = 0
+        long_approach_visible_count = active_stats["reliable_active_visible_count"]
+        long_approach_centered_count = active_stats["reliable_centered_count"]
+        long_approach_weak_count = active_stats["weak_completion_candidate_count"]
+        long_approach_step_span = 0
+        long_approach_confirmed = False
+        long_approach_confirmed_reason = ""
+        long_approach_confirmed_count = active_stats["long_approach_confirmed_count"]
+
+        if fallback_used:
+            active_stats["ignored_fallback_count"] += 1
+            active_stats["consecutive_tracker_completion_count"] = 0
+            active_stats["consecutive_long_approach_confirmed_count"] = 0
+            ignored_due_to_fallback = True
+            stage_memory_note = "ignored_due_to_fallback"
+        elif reliable:
+            if active_stats["stage_first_reliable_step"] is None:
+                active_stats["stage_first_reliable_step"] = step_id
+            if observed_stage_id >= 0:
+                active_stats["recent_observed_stage_ids"].append(observed_stage_id)
+                active_stats["recent_observed_stage_ids"] = active_stats["recent_observed_stage_ids"][-20:]
+            active_stats["recent_progress"].append(stage_progress)
+            active_stats["recent_progress"] = active_stats["recent_progress"][-20:]
+            if observed_stage_id == self.active_stage:
+                active_stats["reliable_observed_count"] += 1
+            if active_stage_target_visible:
+                active_stats["reliable_active_visible_count"] += 1
+                active_stats["consecutive_active_visible_count"] += 1
+            else:
+                active_stats["consecutive_active_visible_count"] = 0
+            if active_stage_target_centered:
+                active_stats["reliable_centered_count"] += 1
+                active_stats["consecutive_centered_count"] += 1
+            else:
+                active_stats["consecutive_centered_count"] = 0
+            if active_stage_target_close:
+                active_stats["reliable_close_count"] += 1
+                active_stats["consecutive_close_count"] += 1
+            else:
+                active_stats["consecutive_close_count"] = 0
+            if active_stage_target_passed:
+                active_stats["reliable_passed_count"] += 1
+                active_stats["consecutive_passed_count"] += 1
+            else:
+                active_stats["consecutive_passed_count"] = 0
+            if stage_complete_candidate:
+                active_stats["consecutive_complete_count"] += 1
+                active_stats["transition_candidates"].append(
+                    {
+                        "step_id": step_id,
+                        "confidence": confidence,
+                        "stage_progress": stage_progress,
+                        "observed_stage_id": observed_stage_id,
+                    }
+                )
+            else:
+                active_stats["consecutive_complete_count"] = 0
+
+            if active_stage_target_close:
+                self._activate_close_memory(active_stats, step_id, confidence, "close_true")
+            elif stage_progress == "near":
+                self._activate_close_memory(active_stats, step_id, confidence, "progress_near")
+            elif stage_complete_candidate:
+                self._activate_close_memory(active_stats, step_id, confidence, "vlm_complete")
+
+            clear_close_memory = (
+                (not active_stage_target_visible and observed_stage_id != self.active_stage)
+                or stage_progress == "lost"
+                or active_stage_target_passed
+                or (observed_stage_id >= 0 and observed_stage_id != self.active_stage and not active_stage_target_visible)
+            )
+            if clear_close_memory and active_stats["close_memory_active"]:
+                self._clear_close_memory(active_stats)
+                active_stats["close_memory_cleared_count"] += 1
+                active_stats["close_memory_blocked_count"] += 1
+                close_memory_event_note = "close_memory_cleared=lost_or_mismatch"
+                stage_memory_note = close_memory_event_note
+                print(f"[STAGE] close memory cleared stage={self.active_stage} step={step_id} reason=lost_or_mismatch")
+
+            close_memory_age = self._close_memory_age(active_stats, step_id)
+            active_stats["close_memory_age"] = close_memory_age
+            if (
+                active_stats["close_memory_active"]
+                and close_memory_age != ""
+                and close_memory_age > active_stats["close_memory_valid_window"]
+            ):
+                last_close_step = active_stats["last_close_step"]
+                self._clear_close_memory(active_stats)
+                active_stats["close_memory_expired_count"] += 1
+                close_memory_event_note = "close_memory_expired"
+                stage_memory_note = close_memory_event_note
+                print(f"[STAGE] close memory expired stage={self.active_stage} step={step_id} last_close_step={last_close_step}")
+
+            if (
+                active_stats["consecutive_centered_count"] >= 3
+                and active_stats["consecutive_active_visible_count"] >= 3
+            ):
+                weak_completion_candidate = True
+                weak_completion_reason = "centered_visible_count"
+                active_stats["weak_completion_candidate_count"] += 1
+                active_stats["weak_transition_candidate_steps"].append(
+                    {
+                        "step_id": step_id,
+                        "reason": weak_completion_reason,
+                        "confidence": confidence,
+                    }
+                )
+                stage_memory_note = f"weak_completion_candidate={weak_completion_reason}"
+                print(
+                    f"[STAGE] weak completion candidate stage={self.active_stage} "
+                    f"step={step_id} reason={weak_completion_reason}"
+                )
+
+            if active_stats["consecutive_close_count"] >= 2:
+                tracker_completion_candidate = True
+                tracker_completion_reason = "close_count"
+            elif active_stage_target_passed:
+                tracker_completion_candidate = True
+                tracker_completion_reason = "passed"
+            elif active_stats["consecutive_complete_count"] >= 2:
+                tracker_completion_candidate = True
+                tracker_completion_reason = "vlm_complete_count"
+            elif (
+                active_stats["close_memory_active"]
+                and active_stats["close_memory_age"] != ""
+                and active_stats["close_memory_age"] <= active_stats["close_memory_valid_window"]
+                and (active_stage_target_visible or active_stage_target_centered)
+            ):
+                tracker_completion_candidate = True
+                tracker_completion_reason = "smoothed_close_memory"
+
+            recent_observed = active_stats["recent_observed_stage_ids"]
+            active_observed_count = sum(1 for item in recent_observed if item == self.active_stage)
+            majority_observed_active = bool(recent_observed) and active_observed_count > len(recent_observed) / 2
+            first_reliable_step = active_stats["stage_first_reliable_step"]
+            long_approach_step_span = 0 if first_reliable_step is None else step_id - first_reliable_step
+            long_approach_visible_count = active_stats["reliable_active_visible_count"]
+            long_approach_centered_count = active_stats["reliable_centered_count"]
+            long_approach_weak_count = active_stats["weak_completion_candidate_count"]
+
+            if long_approach_visible_count >= 6:
+                long_approach_score += 1
+            if long_approach_centered_count >= 4:
+                long_approach_score += 1
+            if long_approach_weak_count >= 3:
+                long_approach_score += 1
+            if majority_observed_active:
+                long_approach_score += 1
+            if long_approach_step_span >= 10:
+                long_approach_score += 1
+            if active_stats["reliable_close_count"] == 0 and active_stats["reliable_passed_count"] == 0:
+                long_approach_score += 1
+
+            long_approach_candidate = (
+                long_approach_score >= 5
+                and active_stage_target_visible
+                and long_approach_centered_count >= 4
+                and long_approach_weak_count >= 3
+                and majority_observed_active
+                and active_stats["reliable_close_count"] == 0
+                and active_stats["reliable_passed_count"] == 0
+                and (long_approach_step_span >= 8 or long_approach_visible_count >= 6)
+            )
+            if long_approach_candidate:
+                long_approach_reason = "stable_visible_centered_but_no_close"
+                active_stats["long_approach_candidate_count"] += 1
+                active_stats["long_approach_max_score"] = max(
+                    active_stats["long_approach_max_score"],
+                    long_approach_score,
+                )
+                if active_stats["long_approach_first_step"] is None:
+                    active_stats["long_approach_first_step"] = step_id
+                active_stats["long_approach_last_step"] = step_id
+                active_stats["long_approach_candidate_steps"].append(
+                    {
+                        "step_id": step_id,
+                        "score": long_approach_score,
+                        "reason": long_approach_reason,
+                        "visible_count": long_approach_visible_count,
+                        "centered_count": long_approach_centered_count,
+                        "weak_count": long_approach_weak_count,
+                        "step_span": long_approach_step_span,
+                    }
+                )
+                if stage_memory_note:
+                    stage_memory_note = f"{stage_memory_note}; long_approach_candidate={long_approach_reason}"
+                else:
+                    stage_memory_note = f"long_approach_candidate={long_approach_reason}"
+                print(
+                    f"[STAGE] long approach candidate stage={self.active_stage} "
+                    f"step={step_id} score={long_approach_score} reason={long_approach_reason}"
+                )
+
+            long_approach_confirmed = (
+                long_approach_candidate
+                and long_approach_score >= 5
+                and active_stage_target_visible
+                and observed_stage_id == self.active_stage
+                and active_stats["long_approach_candidate_count"] >= 2
+                and self.active_stage < len(self.stage_plan) - 1
+                and (long_approach_step_span >= 10 or long_approach_visible_count >= 8)
+                and active_stats["reliable_close_count"] == 0
+                and active_stats["reliable_passed_count"] == 0
+                and not tracker_completion_candidate
+            )
+            if long_approach_confirmed:
+                long_approach_confirmed_reason = "repeated_long_approach_without_close"
+                active_stats["long_approach_confirmed_count"] += 1
+                active_stats["consecutive_long_approach_confirmed_count"] += 1
+                long_approach_confirmed_count = active_stats["long_approach_confirmed_count"]
+                active_stats["long_approach_confirmed_steps"].append(
+                    {
+                        "step_id": step_id,
+                        "score": long_approach_score,
+                        "reason": long_approach_confirmed_reason,
+                        "visible_count": long_approach_visible_count,
+                        "centered_count": long_approach_centered_count,
+                        "weak_count": long_approach_weak_count,
+                        "step_span": long_approach_step_span,
+                    }
+                )
+                tracker_completion_candidate = True
+                tracker_completion_reason = "long_approach_confirmed"
+                if stage_memory_note:
+                    stage_memory_note = f"{stage_memory_note}; long_approach_confirmed={long_approach_confirmed_reason}"
+                else:
+                    stage_memory_note = f"long_approach_confirmed={long_approach_confirmed_reason}"
+            elif not fallback_used:
+                active_stats["consecutive_long_approach_confirmed_count"] = 0
+
+            if tracker_completion_candidate:
+                active_stats["tracker_completion_candidate_count"] += 1
+                active_stats["consecutive_tracker_completion_count"] += 1
+                if tracker_completion_reason == "smoothed_close_memory":
+                    active_stats["close_memory_candidate_count"] += 1
+                transition_candidate = {
+                    "step_id": step_id,
+                    "reason": tracker_completion_reason,
+                    "confidence": confidence,
+                }
+                if tracker_completion_reason == "long_approach_confirmed":
+                    transition_candidate["score"] = long_approach_score
+                active_stats["transition_candidate_steps"].append(transition_candidate)
+                tracker_note = f"tracker_completion_candidate={tracker_completion_reason}"
+                stage_memory_note = f"{stage_memory_note}; {tracker_note}" if stage_memory_note else tracker_note
+                if tracker_completion_reason == "long_approach_confirmed":
+                    print(
+                        f"[STAGE] strong completion candidate stage={self.active_stage} "
+                        f"step={step_id} reason=long_approach_confirmed score={long_approach_score}"
+                    )
+                else:
+                    print(
+                        f"[STAGE] strong completion candidate stage={self.active_stage} "
+                        f"step={step_id} reason={tracker_completion_reason}"
+                    )
+                if (
+                    active_stats["consecutive_tracker_completion_count"] < 2
+                    and self.active_stage < len(self.stage_plan) - 1
+                ):
+                    print(
+                        f"[STAGE] strong candidate held stage={self.active_stage} "
+                        f"step={step_id} reason={tracker_completion_reason} "
+                        f"consecutive={active_stats['consecutive_tracker_completion_count']} need=2"
+                    )
+            else:
+                active_stats["consecutive_tracker_completion_count"] = 0
+        else:
+            active_stats["consecutive_active_visible_count"] = 0
+            active_stats["consecutive_centered_count"] = 0
+            active_stats["consecutive_close_count"] = 0
+            active_stats["consecutive_passed_count"] = 0
+            active_stats["consecutive_complete_count"] = 0
+            active_stats["consecutive_tracker_completion_count"] = 0
+            active_stats["consecutive_long_approach_confirmed_count"] = 0
+
+        if fallback_used:
+            close_memory_age = self._close_memory_age(active_stats, step_id)
+            active_stats["close_memory_age"] = close_memory_age
+            if (
+                active_stats["close_memory_active"]
+                and close_memory_age != ""
+                and close_memory_age > active_stats["close_memory_valid_window"]
+            ):
+                last_close_step = active_stats["last_close_step"]
+                self._clear_close_memory(active_stats)
+                active_stats["close_memory_expired_count"] += 1
+                close_memory_event_note = "close_memory_expired"
+                stage_memory_note = f"{stage_memory_note}; {close_memory_event_note}"
+                print(f"[STAGE] close memory expired stage={self.active_stage} step={step_id} last_close_step={last_close_step}")
+
+        previous_stage = self.active_stage
+        stage_transition = ""
+        stage_transition_candidate = tracker_completion_candidate
+        tracker_consecutive_count = active_stats["consecutive_tracker_completion_count"]
+        long_approach_consecutive_count = active_stats["consecutive_long_approach_confirmed_count"]
+        if (
+            tracker_completion_candidate
+            and reliable
+            and tracker_consecutive_count >= 2
+            and self.active_stage < len(self.stage_plan) - 1
+        ):
+            self.stage_plan[self.active_stage]["status"] = "completed"
+            self.active_stage += 1
+            self.stage_plan[self.active_stage]["status"] = "active"
+            active_stats["consecutive_tracker_completion_count"] = 0
+            self._reset_stage_runtime_counts(self.stage_stats[self.active_stage])
+            stage_transition = f"stage_{previous_stage}_to_{self.active_stage}:{tracker_completion_reason}"
+            transition_note = (
+                "stage_transition=long_approach_confirmed"
+                if tracker_completion_reason == "long_approach_confirmed"
+                else "transition_by_strong_tracker_completion"
+            )
+            stage_memory_note = f"{stage_memory_note}; {transition_note}" if stage_memory_note else transition_note
+            self.transitions.append(
+                {
+                    "step_id": step_id,
+                    "from_stage": previous_stage,
+                    "to_stage": self.active_stage,
+                    "reason": tracker_completion_reason,
+                    "tracker_completion_reason": tracker_completion_reason,
+                    "long_approach_score": long_approach_score if tracker_completion_reason == "long_approach_confirmed" else "",
+                    "visible_count": long_approach_visible_count if tracker_completion_reason == "long_approach_confirmed" else "",
+                    "centered_count": long_approach_centered_count if tracker_completion_reason == "long_approach_confirmed" else "",
+                    "weak_count": long_approach_weak_count if tracker_completion_reason == "long_approach_confirmed" else "",
+                    "step_span": long_approach_step_span if tracker_completion_reason == "long_approach_confirmed" else "",
+                    "consecutive_tracker_completion_count": tracker_consecutive_count,
+                }
+            )
+            print(
+                f"[STAGE] transition stage {previous_stage} -> {self.active_stage} "
+                f"at step {step_id} reason={tracker_completion_reason}"
+            )
+
+        evidence = {
+            "step_id": step_id,
+            "active_stage": evaluated_stage,
+            "observed_stage_id": observed_stage_id,
+            "active_stage_target_visible": active_stage_target_visible,
+            "active_stage_target_centered": active_stage_target_centered,
+            "active_stage_target_close": active_stage_target_close,
+            "active_stage_target_passed": active_stage_target_passed,
+            "stage_target_visible": active_stage_target_visible,
+            "stage_progress": stage_progress,
+            "stage_complete_candidate": stage_complete_candidate,
+            "weak_stage_completion_candidate": weak_completion_candidate,
+            "weak_stage_completion_reason": weak_completion_reason,
+            "stage_completion_candidate_by_tracker": tracker_completion_candidate,
+            "tracker_completion_reason": tracker_completion_reason,
+            "stage_transition_candidate": stage_transition_candidate,
+            "long_approach_candidate": long_approach_candidate,
+            "long_approach_reason": long_approach_reason,
+            "long_approach_score": long_approach_score,
+            "long_approach_visible_count": long_approach_visible_count,
+            "long_approach_centered_count": long_approach_centered_count,
+            "long_approach_weak_count": long_approach_weak_count,
+            "long_approach_step_span": long_approach_step_span,
+            "long_approach_confirmed": long_approach_confirmed,
+            "long_approach_confirmed_reason": long_approach_confirmed_reason,
+            "long_approach_confirmed_count": long_approach_confirmed_count,
+            "consecutive_tracker_completion_count": tracker_consecutive_count,
+            "consecutive_long_approach_confirmed_count": long_approach_consecutive_count,
+            "close_memory_active": active_stats["close_memory_active"],
+            "close_memory_age": active_stats["close_memory_age"],
+            "close_memory_source": active_stats["close_memory_source"],
+            "last_close_step": active_stats["last_close_step"],
+            "last_near_step": active_stats["last_near_step"],
+            "confidence": confidence,
+            "fallback_used": fallback_used,
+            "ignored_due_to_fallback": ignored_due_to_fallback,
+            "stage_transition": stage_transition,
+            "stage_memory_note": stage_memory_note,
+        }
+        self.recent_evidence.append(evidence)
+        if len(self.recent_evidence) > 20:
+            self.recent_evidence = self.recent_evidence[-20:]
+
+        print(
+            "[STAGE] "
+            f"active={evaluated_stage} observed={observed_stage_id} "
+            f"visible={active_stage_target_visible} centered={active_stage_target_centered} "
+            f"close={active_stage_target_close} passed={active_stage_target_passed} "
+            f"progress={stage_progress} complete={stage_complete_candidate} "
+            f"weak={weak_completion_candidate} strong={tracker_completion_candidate} "
+            f"long_approach={long_approach_candidate} score={long_approach_score} "
+            f"long_approach_confirmed={long_approach_confirmed} tracker_reason={tracker_completion_reason} "
+            f"close_mem={active_stats['close_memory_active']} age={active_stats['close_memory_age']} "
+            f"source={active_stats['close_memory_source']} fallback={fallback_used} "
+            f"ignored={ignored_due_to_fallback}"
+        )
+        return evidence
+
+    def to_json(self):
+        return {
+            "active_stage": self.active_stage,
+            "stage_plan": self.stage_plan,
+            "recent_evidence": self.recent_evidence,
+            "stage_stats": self.stage_stats,
+            "transitions": self.transitions,
+        }
+
+
+def save_stage_outputs(stage_plan, stage_tracker, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "stage_plan.json"), "w", encoding="utf-8") as f:
+        json.dump(stage_plan, f, indent=2)
+    if stage_tracker is not None:
+        with open(os.path.join(output_dir, "stage_memory.json"), "w", encoding="utf-8") as f:
+            json.dump(stage_tracker.to_json(), f, indent=2)
+
+
+def save_memory_graph(graph, output_dir, stage_plan=None, stage_tracker=None):
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = os.path.join(output_dir, "memory_graph.json")
+    nodes_path = os.path.join(output_dir, "memory_nodes.csv")
+    edges_path = os.path.join(output_dir, "memory_edges.csv")
+    graph.save_json(json_path)
+    graph.save_nodes_csv(nodes_path)
+    graph.save_edges_csv(edges_path)
+    if stage_plan is not None:
+        save_stage_outputs(stage_plan, stage_tracker, output_dir)
+    print(f"[MEMORY] saved graph to {json_path}")
+
+
+def maybe_add_memory_node(
+    graph,
+    output_dir,
+    args,
+    env_name,
+    sample_id,
+    instruction,
+    pose,
+    step_id,
+    ours_info,
+    action_id,
+    end_position,
+    reason=None,
+    stage_evidence=None,
+    stage_plan=None,
+    stage_tracker=None,
+):
+    if not args.enable_memory_record:
+        return None
+
+    selected_choice = ours_info.get("choice", "")
+    selected_group = choice_group(selected_choice)
+    visible = ours_info.get("target_visible", "")
+    fallback_used = ours_info.get("fallback_used", "")
+    action_name = action_id_to_name(action_id)
+    distance_to_goal = calculate_distance(end_position, pose[:3])
+    stage_evidence = stage_evidence or {}
+
+    add_reason = reason
+    if add_reason is None:
+        if not graph.nodes:
+            add_reason = "start"
+        else:
+            last_node = graph.nodes[-1]
+            last_pose = (
+                last_node["pose_x"],
+                last_node["pose_y"],
+                last_node["pose_z"],
+                last_node["yaw"],
+            )
+            if pose_distance(pose, last_pose) >= args.memory_sample_dist:
+                add_reason = "distance"
+            elif yaw_delta_deg(pose[3], last_pose[3]) >= args.memory_sample_yaw_deg:
+                add_reason = "yaw"
+            elif str(action_id) != str(last_node.get("action_id", "")):
+                add_reason = "action_change"
+            elif selected_group != last_node.get("choice_group", ""):
+                add_reason = "choice_group_change"
+            elif str(visible) != str(last_node.get("target_visible", "")):
+                add_reason = "target_visible_change"
+            elif str(fallback_used) != str(last_node.get("fallback_used", "")):
+                add_reason = "fallback_change"
+
+    if add_reason is None:
+        return None
+
+    previous_node = graph.nodes[-1] if graph.nodes else None
+    is_revisit = False
+    revisit_from_node = None
+    for node in graph.nodes[:-1]:
+        node_pose = (node["pose_x"], node["pose_y"], node["pose_z"], node["yaw"])
+        if pose_distance(pose, node_pose) <= args.memory_revisit_dist:
+            is_revisit = True
+            revisit_from_node = node
+            break
+
+    node = graph.add_node(
+        env_name=env_name,
+        sample_id=sample_id,
+        step_id=step_id,
+        source="online_task_run",
+        pose_x=pose[0],
+        pose_y=pose[1],
+        pose_z=pose[2],
+        yaw_deg=pose[3],
+        rgb_path=ours_info.get("input_image_path", ""),
+        instruction=instruction,
+        selected_image_path=ours_info.get("selected_image_path", ""),
+        choice=selected_choice,
+        choice_group=selected_group,
+        action_id=action_id,
+        action_name=action_name,
+        target_visible=visible,
+        confidence=ours_info.get("confidence", ""),
+        reason=add_reason,
+        raw_response=ours_info.get("raw_response", ""),
+        fallback_used=fallback_used,
+        distance_to_goal=distance_to_goal,
+        auto_tag=add_reason,
+        is_revisit=is_revisit,
+        active_stage=stage_evidence.get("active_stage", ""),
+        observed_stage_id=stage_evidence.get("observed_stage_id", ""),
+        active_stage_target_visible=stage_evidence.get("active_stage_target_visible", ""),
+        active_stage_target_centered=stage_evidence.get("active_stage_target_centered", ""),
+        active_stage_target_close=stage_evidence.get("active_stage_target_close", ""),
+        active_stage_target_passed=stage_evidence.get("active_stage_target_passed", ""),
+        stage_target_visible=stage_evidence.get("active_stage_target_visible", ""),
+        stage_progress=stage_evidence.get("stage_progress", ""),
+        stage_complete_candidate=stage_evidence.get("stage_complete_candidate", ""),
+        weak_stage_completion_candidate=stage_evidence.get("weak_stage_completion_candidate", ""),
+        weak_stage_completion_reason=stage_evidence.get("weak_stage_completion_reason", ""),
+        stage_completion_candidate_by_tracker=stage_evidence.get("stage_completion_candidate_by_tracker", ""),
+        tracker_completion_reason=stage_evidence.get("tracker_completion_reason", ""),
+        stage_transition_candidate=stage_evidence.get("stage_transition_candidate", ""),
+        stage_transition=stage_evidence.get("stage_transition", ""),
+        long_approach_candidate=stage_evidence.get("long_approach_candidate", ""),
+        long_approach_reason=stage_evidence.get("long_approach_reason", ""),
+        long_approach_score=stage_evidence.get("long_approach_score", ""),
+        long_approach_visible_count=stage_evidence.get("long_approach_visible_count", ""),
+        long_approach_centered_count=stage_evidence.get("long_approach_centered_count", ""),
+        long_approach_weak_count=stage_evidence.get("long_approach_weak_count", ""),
+        long_approach_step_span=stage_evidence.get("long_approach_step_span", ""),
+        long_approach_confirmed=stage_evidence.get("long_approach_confirmed", ""),
+        long_approach_confirmed_reason=stage_evidence.get("long_approach_confirmed_reason", ""),
+        long_approach_confirmed_count=stage_evidence.get("long_approach_confirmed_count", ""),
+        consecutive_tracker_completion_count=stage_evidence.get("consecutive_tracker_completion_count", ""),
+        consecutive_long_approach_confirmed_count=stage_evidence.get("consecutive_long_approach_confirmed_count", ""),
+        close_memory_active=stage_evidence.get("close_memory_active", ""),
+        close_memory_age=stage_evidence.get("close_memory_age", ""),
+        close_memory_source=stage_evidence.get("close_memory_source", ""),
+        last_close_step=stage_evidence.get("last_close_step", ""),
+        last_near_step=stage_evidence.get("last_near_step", ""),
+        stage_memory_note=stage_evidence.get("stage_memory_note") or (
+            f"active_stage={stage_evidence.get('active_stage', '')}; "
+            f"observed_stage_id={stage_evidence.get('observed_stage_id', '')}; "
+            f"progress={stage_evidence.get('stage_progress', '')}"
+        ),
+    )
+
+    if previous_node is not None:
+        previous_pose = (
+            previous_node["pose_x"],
+            previous_node["pose_y"],
+            previous_node["pose_z"],
+            previous_node["yaw"],
+        )
+        graph.add_edge(
+            from_node=previous_node["node_id"],
+            to_node=node["node_id"],
+            edge_type="trajectory",
+            distance=pose_distance(pose, previous_pose),
+            yaw_delta=yaw_delta_deg(pose[3], previous_pose[3]),
+            step_start=previous_node["step_id"],
+            step_end=step_id,
+            actions_between=[action_id],
+            choices_between=[selected_choice],
+        )
+
+    if revisit_from_node is not None:
+        revisit_pose = (
+            revisit_from_node["pose_x"],
+            revisit_from_node["pose_y"],
+            revisit_from_node["pose_z"],
+            revisit_from_node["yaw"],
+        )
+        graph.add_edge(
+            from_node=revisit_from_node["node_id"],
+            to_node=node["node_id"],
+            edge_type="revisit",
+            distance=pose_distance(pose, revisit_pose),
+            yaw_delta=yaw_delta_deg(pose[3], revisit_pose[3]),
+            step_start=revisit_from_node["step_id"],
+            step_end=step_id,
+            actions_between=[],
+            choices_between=[],
+        )
+
+    print(
+        "[MEMORY] add node "
+        f"id={node['node_id']}, reason={add_reason}, step={step_id}, "
+        f"pose=({pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f}), "
+        f"choice={selected_choice}, action={action_id}"
+    )
+    save_memory_graph(graph, output_dir, stage_plan=stage_plan, stage_tracker=stage_tracker)
+    return node
 
 def get_action(policy, processor, image_list, text, his, if_his=False, his_step=0):
 
@@ -500,6 +1304,10 @@ def main():
     parser.add_argument("--max_envs", type=int, default=None)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--enable_memory_record", type=parse_bool, default=True)
+    parser.add_argument("--memory_sample_dist", type=float, default=12.0)
+    parser.add_argument("--memory_sample_yaw_deg", type=float, default=35.0)
+    parser.add_argument("--memory_revisit_dist", type=float, default=8.0)
     args, _unknown = parser.parse_known_args()
 
     eval_info = "/workspace/smbu_zzh/OpenFly-Platform/configs/eval_test0.json"
@@ -561,6 +1369,13 @@ def main():
                 "yaw",
                 "input_image_path",
                 "selected_image_path",
+                "observed_stage_id",
+                "active_stage_target_visible",
+                "active_stage_target_centered",
+                "active_stage_target_close",
+                "active_stage_target_passed",
+                "stage_progress",
+                "stage_complete_candidate",
             ],
         )
         if csv_file.tell() == 0:
@@ -625,6 +1440,27 @@ def main():
             print(f"goal_position: {end_position}")
             print(f"initial_yaw: {start_yaw}")
             print(f"gpt_instruction: {text}")
+            memory_graph = None
+            memory_dir = None
+            stage_plan = None
+            stage_tracker = None
+            last_ours_info = None
+            last_stage_evidence = None
+            last_model_action = None
+            last_step_id = None
+            if args.agent_type == "ours" and args.enable_memory_record:
+                memory_dir = memory_output_dir(args.ours_output_dir, env_name, idx)
+                stage_plan = extract_stage_plan(text)
+                if stage_plan:
+                    stage_plan[0]["status"] = "active"
+                stage_tracker = StageMemoryTracker(stage_plan)
+                save_stage_outputs(stage_plan, stage_tracker, memory_dir)
+                memory_graph = MemoryGraph(
+                    source="online_task_run",
+                    env_name=env_name,
+                    sample_id=idx,
+                    instruction=text,
+                )
             
             stop_error = 1
             image_error = False
@@ -663,7 +1499,33 @@ def main():
                             step_id=step,
                             pose=pose_before,
                             history=image_list,
+                            stage_plan=stage_plan,
+                            active_stage=stage_tracker.active_stage if stage_tracker is not None else 0,
                         )
+                        stage_evidence = None
+                        if stage_tracker is not None:
+                            stage_evidence = stage_tracker.update(step, ours_info)
+                        if memory_graph is not None:
+                            maybe_add_memory_node(
+                                graph=memory_graph,
+                                output_dir=memory_dir,
+                                args=args,
+                                env_name=env_name,
+                                sample_id=idx,
+                                instruction=text,
+                                pose=pose_before,
+                                step_id=step,
+                                ours_info=ours_info,
+                                action_id=model_action,
+                                end_position=end_position,
+                                stage_evidence=stage_evidence,
+                                stage_plan=stage_plan,
+                                stage_tracker=stage_tracker,
+                            )
+                        last_ours_info = ours_info
+                        last_stage_evidence = stage_evidence
+                        last_model_action = model_action
+                        last_step_id = step
                         csv_writer.writerow(
                             {
                                 "env_name": env_name,
@@ -691,6 +1553,13 @@ def main():
                                 "yaw": pose_before[3],
                                 "input_image_path": ours_info.get("input_image_path", ""),
                                 "selected_image_path": ours_info.get("selected_image_path", ""),
+                                "observed_stage_id": ours_info.get("observed_stage_id", ""),
+                                "active_stage_target_visible": ours_info.get("active_stage_target_visible", ""),
+                                "active_stage_target_centered": ours_info.get("active_stage_target_centered", ""),
+                                "active_stage_target_close": ours_info.get("active_stage_target_close", ""),
+                                "active_stage_target_passed": ours_info.get("active_stage_target_passed", ""),
+                                "stage_progress": ours_info.get("stage_progress", ""),
+                                "stage_complete_candidate": ours_info.get("stage_complete_candidate", ""),
                             }
                         )
                         csv_file.flush()
@@ -716,7 +1585,49 @@ def main():
                     break
             
             if image_error:
+                if memory_graph is not None:
+                    save_memory_graph(
+                        memory_graph,
+                        memory_dir,
+                        stage_plan=stage_plan,
+                        stage_tracker=stage_tracker,
+                    )
                 continue
+
+            if memory_graph is not None:
+                final_info = last_ours_info or {
+                    "choice": "",
+                    "target_visible": "",
+                    "confidence": "",
+                    "reason": "",
+                    "fallback_used": "",
+                    "raw_response": "",
+                    "input_image_path": "",
+                    "selected_image_path": "",
+                }
+                maybe_add_memory_node(
+                    graph=memory_graph,
+                    output_dir=memory_dir,
+                    args=args,
+                    env_name=env_name,
+                    sample_id=idx,
+                    instruction=text,
+                    pose=new_pose,
+                    step_id=last_step_id if last_step_id is not None else step,
+                    ours_info=final_info,
+                    action_id=last_model_action if last_model_action is not None else "",
+                    end_position=end_position,
+                    reason="final",
+                    stage_evidence=last_stage_evidence,
+                    stage_plan=stage_plan,
+                    stage_tracker=stage_tracker,
+                )
+                save_memory_graph(
+                    memory_graph,
+                    memory_dir,
+                    stage_plan=stage_plan,
+                    stage_tracker=stage_tracker,
+                )
                 
             model_end_position = new_pose
             dis = calculate_distance(end_position, model_end_position)
