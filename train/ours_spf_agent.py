@@ -39,10 +39,11 @@ P_TO_ACTION_ID = {
 
 
 class OurSPFAgent:
-    def __init__(self, base_url, model_name, output_dir):
+    def __init__(self, base_url, model_name, output_dir, request_timeout=180):
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
         self.output_dir = output_dir
+        self.request_timeout = request_timeout
         self.image_dir = os.path.join(output_dir, "images")
         os.makedirs(self.image_dir, exist_ok=True)
 
@@ -296,7 +297,7 @@ class OurSPFAgent:
             f"{self.base_url}/chat/completions",
             headers={"Authorization": "Bearer EMPTY", "Content-Type": "application/json"},
             json=payload,
-            timeout=60,
+            timeout=self.request_timeout,
         )
         if response.status_code >= 400 and "response_format" in payload:
             payload.pop("response_format", None)
@@ -304,7 +305,7 @@ class OurSPFAgent:
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": "Bearer EMPTY", "Content-Type": "application/json"},
                 json=payload,
-                timeout=60,
+                timeout=self.request_timeout,
             )
         response.raise_for_status()
         data = response.json()

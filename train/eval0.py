@@ -32,7 +32,11 @@ import requests
 import random
 from ours_spf_agent import OurSPFAgent
 from memory_graph import MemoryGraph
+from stage_parser import parse_stage_plan
 
+
+CONFIRMED_FINISH_READY_STREAK = 2
+EARLY_FINISH_CONFIRM_POLICY = "strict_window_plus_2_ready_streak"
 
 
 
@@ -43,27 +47,78 @@ def kill_env_process(keyword):
         subprocess.run(['kill', '-9', cr_pid])
 
 class AirsimBridge:
-    def __init__(self, env_name):
+    def __init__(self, env_name, airsim_root, airsim_port, startup_timeout, rpc_timeout):
         self.env_name = env_name
-        self._sim_thread = threading.Thread(target=self._init_airsim_sim)
-        self._sim_thread.start()
-        time.sleep(10)
-
-        self._client = airsim.MultirotorClient()
-        self._client.confirmConnection()
+        self.airsim_root = airsim_root
+        self.airsim_port = airsim_port
+        self.startup_timeout = startup_timeout
+        self.rpc_timeout = rpc_timeout
+        self.process = None
+        self._sim_log_file = None
+        self._sim_log_path = os.path.join("/tmp", f"openfly_{self.env_name}_airsim.log")
+        self._start_airsim_sim()
+        self._client = self._connect_airsim()
         self._client.enableApiControl(True)
         self._client.armDisarm(True)
 
-    def _init_airsim_sim(self):
-        env_dir = "/workspace/smbu_zzh/OpenFly-Platform/envs/airsim/" + self.env_name 
+    def _start_airsim_sim(self):
+        env_dir = os.path.join(self.airsim_root, self.env_name)
+        print(f"[AIRSIM] launching env from {env_dir}")
 
         if not os.path.exists(env_dir):
             raise ValueError(f"Specified directory {env_dir} does not exist")
         
         command = ["bash", f"{env_dir}/LinuxNoEditor/start.sh"]
-        self.process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = self.process.communicate()
-        # print("Command output:\n", stdout)
+        self._sim_log_file = open(self._sim_log_path, "w", encoding="utf-8")
+        self.process = subprocess.Popen(
+            command,
+            text=True,
+            stdout=self._sim_log_file,
+            stderr=subprocess.STDOUT,
+        )
+        print(f"[AIRSIM] pid={self.process.pid} log={self._sim_log_path}")
+
+    def _tail_sim_log(self, max_lines=80):
+        if self._sim_log_file is not None:
+            self._sim_log_file.flush()
+        if not os.path.exists(self._sim_log_path):
+            return ""
+        with open(self._sim_log_path, "r", encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-max_lines:]).strip()
+
+    def _connect_airsim(self):
+        print(
+            f"[AIRSIM] waiting for RPC 127.0.0.1:{self.airsim_port} "
+            f"timeout={self.startup_timeout}s"
+        )
+        deadline = time.time() + self.startup_timeout
+        last_error = None
+        while time.time() < deadline:
+            if self.process is not None and self.process.poll() is not None:
+                log_tail = self._tail_sim_log()
+                raise RuntimeError(
+                    f"AirSim process exited early with code {self.process.returncode}. "
+                    f"Log: {self._sim_log_path}\n{log_tail}"
+                )
+            try:
+                client = airsim.MultirotorClient(
+                    ip="127.0.0.1",
+                    port=self.airsim_port,
+                    timeout_value=self.rpc_timeout,
+                )
+                if client.ping():
+                    print(f"[AIRSIM] connected to 127.0.0.1:{self.airsim_port}")
+                    return client
+            except Exception as exc:
+                last_error = exc
+            time.sleep(2)
+
+        log_tail = self._tail_sim_log()
+        raise RuntimeError(
+            f"AirSim RPC not ready on 127.0.0.1:{self.airsim_port} "
+            f"after {self.startup_timeout}s. Last error: {last_error}. "
+            f"Log: {self._sim_log_path}\n{log_tail}"
+        )
 
     def set_camera_pose(self, x, y, z, pitch, yaw, roll):
         target_pose = airsim.Pose(airsim.Vector3r(x, -y, -z),
@@ -103,7 +158,17 @@ class AirsimBridge:
         else:
             image_type = airsim.ImageType.Segmentation
 
-        responses = self._client.simGetImages([airsim.ImageRequest('front_custom', image_type, False, False)])
+        last_error = None
+        for attempt in range(3):
+            try:
+                responses = self._client.simGetImages([airsim.ImageRequest('front_custom', image_type, False, False)])
+                break
+            except Exception as exc:
+                last_error = exc
+                print(f"[AIRSIM] simGetImages failed attempt={attempt + 1}/3 error={exc}")
+                time.sleep(1.0)
+        else:
+            raise last_error
         response = responses[0]
         if response.pixels_as_float:
             img_data = np.array(response.image_data_float, dtype=np.float32)
@@ -449,6 +514,37 @@ def choice_group(choice):
     return ""
 
 
+def active_stage_motion_hint(stage_plan, active_stage):
+    if not stage_plan or active_stage is None:
+        return ""
+    try:
+        stage = stage_plan[int(active_stage)]
+    except (IndexError, TypeError, ValueError):
+        return ""
+    return str(stage.get("motion_hint", "")).lower()
+
+
+def motion_hint_expected_group(stage_plan, active_stage):
+    hint = active_stage_motion_hint(stage_plan, active_stage)
+    has_left = "left" in hint
+    has_right = "right" in hint
+    if has_left and not has_right:
+        return "left"
+    if has_right and not has_left:
+        return "right"
+    if "straight" in hint or "forward" in hint:
+        return "center"
+    return ""
+
+
+def turn_action_for_group(group):
+    if group == "left":
+        return 2
+    if group == "right":
+        return 3
+    return None
+
+
 def parse_bool(value):
     if isinstance(value, bool):
         return value
@@ -464,50 +560,6 @@ def memory_output_dir(base_dir, env_name, sample_id):
     return os.path.join(base_dir, "memory_graphs", env_name, f"sample_{sample_id:04d}")
 
 
-STAGE_SPLIT_RE = re.compile(
-    r"\b(then|finally|next|after that|afterward|afterwards)\b",
-    flags=re.IGNORECASE,
-)
-
-
-def extract_stage_plan(instruction):
-    parts = []
-    last = 0
-    for match in STAGE_SPLIT_RE.finditer(instruction):
-        prefix = instruction[last:match.start()].strip(" ,.;")
-        if prefix:
-            parts.append(prefix)
-        last = match.start()
-    tail = instruction[last:].strip(" ,.;")
-    if tail:
-        parts.append(tail)
-
-    stages = []
-    for idx, stage_text in enumerate(parts or [instruction]):
-        lower = stage_text.lower()
-        motion_hints = []
-        for word in ("left", "right", "straight", "forward", "up", "down", "turn"):
-            if word in lower:
-                motion_hints.append(word)
-        landmark_phrase = stage_text
-        for token in ("toward", "to", "until", "near"):
-            marker = f" {token} "
-            if marker in lower:
-                start = lower.find(marker) + len(marker)
-                landmark_phrase = stage_text[start:].strip(" ,.;")
-                break
-        stages.append(
-            {
-                "stage_id": idx,
-                "stage_text": stage_text,
-                "motion_hint": ", ".join(motion_hints),
-                "landmark_phrase": landmark_phrase,
-                "status": "pending",
-            }
-        )
-    return stages
-
-
 class StageMemoryTracker:
     CLOSE_MEMORY_VALID_WINDOW = 3
 
@@ -516,6 +568,55 @@ class StageMemoryTracker:
         self.active_stage = 0
         self.recent_evidence = []
         self.transitions = []
+        self.task_complete_candidate = False
+        self.task_complete_step = ""
+        self.task_complete_reason = ""
+        self.task_complete_confidence = ""
+        self.final_stage_completion_count = 0
+        self.stop_ready_candidate = False
+        self.stop_ready_reason = ""
+        self.stop_ready_step = ""
+        self.stop_ready_confidence = ""
+        self.stop_ready_count = 0
+        self.first_stop_ready_step = ""
+        self.post_task_complete_steps = 0
+        self.post_task_complete_lost_count = 0
+        self.post_task_complete_revisit_count = 0
+        self.post_task_complete_action_counts = {}
+        self.post_task_complete_control_override_count = 0
+        self.post_task_complete_distance_min = ""
+        self.post_task_complete_distance_last = ""
+        self.post_task_complete_distance_delta = ""
+        self.finish_mode_enter_step = ""
+        self.finish_mode_exit_step = ""
+        self.finish_mode_exit_reason = ""
+        self.finish_mode_reset_count = 0
+        self.finish_mode_invalidated = False
+        self.finish_mode_consecutive_not_ready_count = 0
+        self.finish_mode_consecutive_approaching_count = 0
+        self.finish_mode_consecutive_stop_not_ready_count = 0
+        self.first_finish_ready_step = ""
+        self.finish_ready_reason = ""
+        self.finish_ready_streak = 0
+        self.finish_ready_streak_required = CONFIRMED_FINISH_READY_STREAK
+        self.confirmed_finish_ready_step = ""
+        self.confirmed_finish_ready_reason = ""
+        self.early_finish_confirm_policy = EARLY_FINISH_CONFIRM_POLICY
+        self.finish_ready_blocked_reason = ""
+        self.stage_motion_hint_expected_group = ""
+        self.stage_motion_hint_required_for_finish = False
+        self.stage_motion_hint_satisfied = True
+        self.stage_motion_hint_satisfied_step = ""
+        self.stage_motion_hint_satisfied_reason = ""
+        self.stage_motion_hint_satisfied_by_action = False
+        self.stage_motion_hint_satisfied_by_choice = False
+        self.stage_motion_hint_satisfied_by_override = False
+        self.early_finish_blocked_reason = ""
+        self.early_finish_by_memory = False
+        self.early_finish_step = ""
+        self.early_finish_reason = ""
+        self.post_stop_ready_steps = 0
+        self.post_stop_ready_action_counts = {}
         self.stage_stats = {}
         for stage in stage_plan:
             stage_id = stage["stage_id"]
@@ -560,6 +661,12 @@ class StageMemoryTracker:
                 "long_approach_confirmed_count": 0,
                 "long_approach_confirmed_steps": [],
                 "consecutive_long_approach_confirmed_count": 0,
+                "final_stage_completion_candidate_count": 0,
+                "final_stage_completion_candidate_steps": [],
+                "first_task_complete_step": None,
+                "task_complete_reason": "",
+                "stop_ready_candidate_count": 0,
+                "stop_ready_candidate_steps": [],
             }
 
     def _close_memory_age(self, stats, step_id):
@@ -634,6 +741,18 @@ class StageMemoryTracker:
         long_approach_confirmed = False
         long_approach_confirmed_reason = ""
         long_approach_confirmed_count = active_stats["long_approach_confirmed_count"]
+        final_stage_completion_candidate = False
+        task_complete_candidate = False
+        task_complete_reason = ""
+        task_complete_step = ""
+        task_complete_confidence = ""
+        stop_ready_candidate = False
+        stop_ready_reason = ""
+        stop_ready_step = ""
+        stop_ready_confidence = ""
+        stop_ready_count = self.stop_ready_count
+        memory_control_action = ""
+        memory_control_reason = ""
 
         if fallback_used:
             active_stats["ignored_fallback_count"] += 1
@@ -921,6 +1040,115 @@ class StageMemoryTracker:
         stage_transition_candidate = tracker_completion_candidate
         tracker_consecutive_count = active_stats["consecutive_tracker_completion_count"]
         long_approach_consecutive_count = active_stats["consecutive_long_approach_confirmed_count"]
+        final_completion_reasons = {
+            "close_count",
+            "smoothed_close_memory",
+            "vlm_complete_count",
+            "long_approach_confirmed",
+        }
+        if (
+            tracker_completion_candidate
+            and reliable
+            and tracker_consecutive_count >= 2
+            and self.active_stage == len(self.stage_plan) - 1
+            and tracker_completion_reason in final_completion_reasons
+        ):
+            final_stage_completion_candidate = True
+            task_complete_candidate = True
+            task_complete_reason = tracker_completion_reason
+            task_complete_step = step_id
+            task_complete_confidence = confidence
+            active_stats["final_stage_completion_candidate_count"] += 1
+            active_stats["final_stage_completion_candidate_steps"].append(
+                {
+                    "step_id": step_id,
+                    "reason": tracker_completion_reason,
+                    "confidence": confidence,
+                    "consecutive_tracker_completion_count": tracker_consecutive_count,
+                }
+            )
+            if active_stats["first_task_complete_step"] is None:
+                active_stats["first_task_complete_step"] = step_id
+                active_stats["task_complete_reason"] = tracker_completion_reason
+            if not self.task_complete_candidate:
+                self.task_complete_candidate = True
+                self.task_complete_step = step_id
+                self.task_complete_reason = tracker_completion_reason
+                self.task_complete_confidence = confidence
+            self.final_stage_completion_count += 1
+            complete_note = (
+                f"final_stage_completion_candidate={tracker_completion_reason}; "
+                "task_complete_candidate=true"
+            )
+            stage_memory_note = f"{stage_memory_note}; {complete_note}" if stage_memory_note else complete_note
+            print(
+                f"[STAGE] task complete candidate step={step_id} "
+                f"reason={tracker_completion_reason} confidence={confidence:.2f}"
+            )
+            recent_reliable = [
+                item for item in self.recent_evidence
+                if not bool(item.get("fallback_used", False))
+                and float(item.get("confidence", 0.0) or 0.0) >= 0.8
+                and item.get("active_stage") == evaluated_stage
+            ][-3:]
+            recent_reliable.append(
+                {
+                    "active_stage_target_visible": active_stage_target_visible,
+                    "active_stage_target_centered": active_stage_target_centered,
+                    "stage_progress": stage_progress,
+                    "confidence": confidence,
+                    "fallback_used": fallback_used,
+                    "active_stage": evaluated_stage,
+                }
+            )
+            visible_recent = sum(
+                1 for item in recent_reliable
+                if bool(item.get("active_stage_target_visible", False))
+            )
+            centered_recent = sum(
+                1 for item in recent_reliable
+                if bool(item.get("active_stage_target_centered", False))
+            )
+            lost_recent = any(item.get("stage_progress") == "lost" for item in recent_reliable)
+            first_reliable_step = active_stats["stage_first_reliable_step"]
+            final_stage_reliable_span = 0 if first_reliable_step is None else step_id - first_reliable_step + 1
+            if (
+                confidence >= 0.85
+                and tracker_consecutive_count >= 4
+                and final_stage_reliable_span >= 4
+                and len(recent_reliable) >= 4
+                and visible_recent >= 3
+                and centered_recent >= 2
+                and not lost_recent
+                and tracker_completion_reason in {"close_count", "smoothed_close_memory", "vlm_complete_count"}
+            ):
+                stop_ready_candidate = True
+                stop_ready_reason = "stable_final_close"
+                stop_ready_step = step_id
+                stop_ready_confidence = confidence
+                memory_control_action = "stop_or_finish_candidate"
+                memory_control_reason = "stop_ready_candidate"
+                active_stats["stop_ready_candidate_count"] += 1
+                active_stats["stop_ready_candidate_steps"].append(
+                    {
+                        "step_id": step_id,
+                        "reason": stop_ready_reason,
+                        "confidence": confidence,
+                        "tracker_completion_reason": tracker_completion_reason,
+                        "consecutive_tracker_completion_count": tracker_consecutive_count,
+                    }
+                )
+                if not self.stop_ready_candidate:
+                    self.stop_ready_candidate = True
+                    self.stop_ready_step = step_id
+                    self.stop_ready_reason = stop_ready_reason
+                    self.stop_ready_confidence = confidence
+                    self.first_stop_ready_step = step_id
+                self.stop_ready_count += 1
+                stop_ready_count = self.stop_ready_count
+                ready_note = "stop_ready_candidate=stable_final_close"
+                stage_memory_note = f"{stage_memory_note}; {ready_note}" if stage_memory_note else ready_note
+                print(f"[MEMORY_CONTROL] stop_ready_candidate step={step_id} reason={stop_ready_reason}")
         if (
             tracker_completion_candidate
             and reliable
@@ -987,6 +1215,18 @@ class StageMemoryTracker:
             "long_approach_confirmed_count": long_approach_confirmed_count,
             "consecutive_tracker_completion_count": tracker_consecutive_count,
             "consecutive_long_approach_confirmed_count": long_approach_consecutive_count,
+            "final_stage_completion_candidate": final_stage_completion_candidate,
+            "task_complete_candidate": task_complete_candidate,
+            "task_complete_reason": task_complete_reason,
+            "task_complete_step": task_complete_step,
+            "task_complete_confidence": task_complete_confidence,
+            "stop_ready_candidate": stop_ready_candidate,
+            "stop_ready_reason": stop_ready_reason,
+            "stop_ready_step": stop_ready_step,
+            "stop_ready_confidence": stop_ready_confidence,
+            "stop_ready_count": stop_ready_count,
+            "memory_control_action": memory_control_action,
+            "memory_control_reason": memory_control_reason,
             "close_memory_active": active_stats["close_memory_active"],
             "close_memory_age": active_stats["close_memory_age"],
             "close_memory_source": active_stats["close_memory_source"],
@@ -1017,9 +1257,98 @@ class StageMemoryTracker:
         )
         return evidence
 
+    def record_step_context(self, evidence, action_name="", distance_to_goal="", is_revisit=False):
+        if self.stop_ready_candidate:
+            self.post_stop_ready_steps += 1
+            if action_name:
+                self.post_stop_ready_action_counts[action_name] = (
+                    self.post_stop_ready_action_counts.get(action_name, 0) + 1
+                )
+        if not self.task_complete_candidate:
+            return
+        self.post_task_complete_steps += 1
+        if evidence.get("stage_progress") == "lost" or not bool(
+            evidence.get("active_stage_target_visible", False)
+        ):
+            self.post_task_complete_lost_count += 1
+        if is_revisit:
+            self.post_task_complete_revisit_count += 1
+        if action_name:
+            self.post_task_complete_action_counts[action_name] = (
+                self.post_task_complete_action_counts.get(action_name, 0) + 1
+            )
+        if evidence.get("control_override_used"):
+            self.post_task_complete_control_override_count += 1
+        try:
+            distance_value = float(distance_to_goal)
+        except (TypeError, ValueError):
+            distance_value = None
+        if distance_value is not None:
+            if self.post_task_complete_distance_min == "":
+                self.post_task_complete_distance_min = distance_value
+            else:
+                self.post_task_complete_distance_min = min(
+                    self.post_task_complete_distance_min,
+                    distance_value,
+                )
+            self.post_task_complete_distance_last = distance_value
+            self.post_task_complete_distance_delta = (
+                self.post_task_complete_distance_last - self.post_task_complete_distance_min
+            )
+
     def to_json(self):
         return {
             "active_stage": self.active_stage,
+            "first_task_complete_step": self.task_complete_step,
+            "task_complete_candidate": self.task_complete_candidate,
+            "task_complete_step": self.task_complete_step,
+            "task_complete_reason": self.task_complete_reason,
+            "task_complete_confidence": self.task_complete_confidence,
+            "final_stage_completion_count": self.final_stage_completion_count,
+            "stop_ready_candidate": self.stop_ready_candidate,
+            "stop_ready_reason": self.stop_ready_reason,
+            "stop_ready_step": self.stop_ready_step,
+            "stop_ready_confidence": self.stop_ready_confidence,
+            "stop_ready_count": self.stop_ready_count,
+            "first_stop_ready_step": self.first_stop_ready_step,
+            "post_task_complete_steps": self.post_task_complete_steps,
+            "post_task_complete_lost_count": self.post_task_complete_lost_count,
+            "post_task_complete_revisit_count": self.post_task_complete_revisit_count,
+            "post_task_complete_action_counts": self.post_task_complete_action_counts,
+            "post_task_complete_control_override_count": self.post_task_complete_control_override_count,
+            "post_task_complete_distance_min": self.post_task_complete_distance_min,
+            "post_task_complete_distance_last": self.post_task_complete_distance_last,
+            "post_task_complete_distance_delta": self.post_task_complete_distance_delta,
+            "finish_mode_enter_step": self.finish_mode_enter_step,
+            "finish_mode_exit_step": self.finish_mode_exit_step,
+            "finish_mode_exit_reason": self.finish_mode_exit_reason,
+            "finish_mode_reset_count": self.finish_mode_reset_count,
+            "finish_mode_invalidated": self.finish_mode_invalidated,
+            "finish_mode_consecutive_not_ready_count": self.finish_mode_consecutive_not_ready_count,
+            "finish_mode_consecutive_approaching_count": self.finish_mode_consecutive_approaching_count,
+            "finish_mode_consecutive_stop_not_ready_count": self.finish_mode_consecutive_stop_not_ready_count,
+            "first_finish_ready_step": self.first_finish_ready_step,
+            "finish_ready_reason": self.finish_ready_reason,
+            "finish_ready_streak": self.finish_ready_streak,
+            "finish_ready_streak_required": self.finish_ready_streak_required,
+            "confirmed_finish_ready_step": self.confirmed_finish_ready_step,
+            "confirmed_finish_ready_reason": self.confirmed_finish_ready_reason,
+            "early_finish_confirm_policy": self.early_finish_confirm_policy,
+            "finish_ready_blocked_reason": self.finish_ready_blocked_reason,
+            "stage_motion_hint_expected_group": self.stage_motion_hint_expected_group,
+            "stage_motion_hint_required_for_finish": self.stage_motion_hint_required_for_finish,
+            "stage_motion_hint_satisfied": self.stage_motion_hint_satisfied,
+            "stage_motion_hint_satisfied_step": self.stage_motion_hint_satisfied_step,
+            "stage_motion_hint_satisfied_reason": self.stage_motion_hint_satisfied_reason,
+            "stage_motion_hint_satisfied_by_action": self.stage_motion_hint_satisfied_by_action,
+            "stage_motion_hint_satisfied_by_choice": self.stage_motion_hint_satisfied_by_choice,
+            "stage_motion_hint_satisfied_by_override": self.stage_motion_hint_satisfied_by_override,
+            "early_finish_blocked_reason": self.early_finish_blocked_reason,
+            "early_finish_by_memory": self.early_finish_by_memory,
+            "early_finish_step": self.early_finish_step,
+            "early_finish_reason": self.early_finish_reason,
+            "post_stop_ready_steps": self.post_stop_ready_steps,
+            "post_stop_ready_action_counts": self.post_stop_ready_action_counts,
             "stage_plan": self.stage_plan,
             "recent_evidence": self.recent_evidence,
             "stage_stats": self.stage_stats,
@@ -1047,6 +1376,766 @@ def save_memory_graph(graph, output_dir, stage_plan=None, stage_tracker=None):
     if stage_plan is not None:
         save_stage_outputs(stage_plan, stage_tracker, output_dir)
     print(f"[MEMORY] saved graph to {json_path}")
+
+
+class MemoryControlState:
+    def __init__(self):
+        self.lost_count = 0
+        self.lost_recovery_count = 0
+        self.lost_recovery_streak = 0
+        self.last_search_direction = "right"
+        self.last_visible_choice_group_by_stage = {}
+        self.control_override_count = 0
+        self.finish_mode = False
+        self.finish_mode_enter_step = ""
+        self.finish_mode_exit_step = ""
+        self.finish_mode_exit_reason = ""
+        self.finish_mode_reset_count = 0
+        self.finish_mode_consecutive_not_ready_count = 0
+        self.finish_mode_consecutive_approaching_count = 0
+        self.finish_mode_consecutive_stop_not_ready_count = 0
+        self.finish_mode_invalidated = False
+        self.finish_recent = []
+        self.finish_ready_streak = 0
+        self.finish_ready_streak_required = CONFIRMED_FINISH_READY_STREAK
+        self.first_finish_ready_step = ""
+        self.finish_ready_reason = ""
+        self.confirmed_finish_ready_step = ""
+        self.confirmed_finish_ready_reason = ""
+        self.early_finish_confirm_policy = EARLY_FINISH_CONFIRM_POLICY
+        self.finish_ready_blocked_reason = ""
+        self.motion_hint_override_count_by_stage = {}
+        self.motion_hint_override_recent_by_stage = {}
+        self.motion_hint_override_cooldown_by_stage = {}
+        self.motion_hint_conflict_streak_by_stage = {}
+        self.motion_hint_forward_streak_by_stage = {}
+        self.last_motion_hint_override_step_by_stage = {}
+        self.stage_motion_hint_satisfied_by_stage = {}
+        self.stage_motion_hint_satisfied_step_by_stage = {}
+        self.stage_motion_hint_satisfied_reason_by_stage = {}
+        self.stage_motion_hint_satisfied_by_action_by_stage = {}
+        self.stage_motion_hint_satisfied_by_choice_by_stage = {}
+        self.stage_motion_hint_satisfied_by_override_by_stage = {}
+        self.last_active_stage = None
+
+    def reset_stage_if_needed(self, active_stage):
+        if self.last_active_stage != active_stage:
+            self.last_active_stage = active_stage
+            self.motion_hint_conflict_streak_by_stage[active_stage] = 0
+            self.motion_hint_forward_streak_by_stage[active_stage] = 0
+            self.motion_hint_override_recent_by_stage[active_stage] = 0
+            self.motion_hint_override_cooldown_by_stage[active_stage] = 0
+            self.stage_motion_hint_satisfied_by_stage.pop(active_stage, None)
+            self.stage_motion_hint_satisfied_step_by_stage.pop(active_stage, None)
+            self.stage_motion_hint_satisfied_reason_by_stage.pop(active_stage, None)
+            self.stage_motion_hint_satisfied_by_action_by_stage.pop(active_stage, None)
+            self.stage_motion_hint_satisfied_by_choice_by_stage.pop(active_stage, None)
+            self.stage_motion_hint_satisfied_by_override_by_stage.pop(active_stage, None)
+
+
+def fill_motion_hint_fields(ours_info, stage_evidence, stage_plan):
+    stage_evidence = stage_evidence or {}
+    active_stage = stage_evidence.get("active_stage", 0)
+    actual_group = choice_group(ours_info.get("choice", ""))
+    expected_group = motion_hint_expected_group(stage_plan, active_stage)
+    motion_conflict = bool(expected_group and actual_group and actual_group != expected_group)
+    stage_evidence["motion_hint_expected_group"] = expected_group
+    stage_evidence["motion_hint_actual_group"] = actual_group
+    stage_evidence["motion_hint_conflict"] = motion_conflict
+    stage_evidence.setdefault("motion_hint_control_applied", False)
+    stage_evidence.setdefault("motion_hint_control_reason", "")
+    return expected_group, actual_group, motion_conflict
+
+
+def _finish_window_stats(finish_recent, window_size=12):
+    window = finish_recent[-window_size:]
+    return {
+        "window": window,
+        "length": len(window),
+        "visible_count": sum(1 for item in window if item.get("visible")),
+        "reliable_count": sum(1 for item in window if item.get("reliable")),
+        "near_complete_count": sum(1 for item in window if item.get("near_or_complete")),
+        "approaching_count": sum(1 for item in window if item.get("approaching")),
+        "centered_count": sum(1 for item in window if item.get("centered")),
+        "close_count": sum(1 for item in window if item.get("close")),
+        "stop_ready_count": sum(1 for item in window if item.get("stop_ready")),
+        "lost_count": sum(1 for item in window if item.get("lost")),
+        "complete_count": sum(1 for item in window if item.get("complete")),
+        "finish_ready_count": sum(1 for item in window if item.get("finish_ready")),
+    }
+
+
+def _set_finish_evidence_defaults(stage_evidence, control_state, step_id):
+    finish_mode_age = (
+        step_id - control_state.finish_mode_enter_step
+        if control_state.finish_mode and control_state.finish_mode_enter_step != ""
+        else 0
+    )
+    stage_evidence["finish_mode"] = control_state.finish_mode
+    stage_evidence["finish_mode_enter_step"] = control_state.finish_mode_enter_step
+    stage_evidence["finish_mode_age"] = finish_mode_age
+    stage_evidence["finish_mode_reason"] = ""
+    stage_evidence["finish_mode_exit_step"] = control_state.finish_mode_exit_step
+    stage_evidence["finish_mode_exit_reason"] = control_state.finish_mode_exit_reason
+    stage_evidence["finish_mode_reset_count"] = control_state.finish_mode_reset_count
+    stage_evidence["finish_mode_invalidated"] = control_state.finish_mode_invalidated
+    stage_evidence["finish_mode_consecutive_not_ready_count"] = control_state.finish_mode_consecutive_not_ready_count
+    stage_evidence["finish_mode_consecutive_approaching_count"] = control_state.finish_mode_consecutive_approaching_count
+    stage_evidence["finish_mode_consecutive_stop_not_ready_count"] = control_state.finish_mode_consecutive_stop_not_ready_count
+    stage_evidence["finish_ready_candidate"] = False
+    stage_evidence["finish_ready_reason"] = ""
+    stage_evidence["finish_ready_step"] = ""
+    stage_evidence["finish_ready_blocked_reason"] = control_state.finish_ready_blocked_reason
+    stage_evidence["finish_ready_streak"] = control_state.finish_ready_streak
+    stage_evidence["finish_ready_streak_required"] = control_state.finish_ready_streak_required
+    stage_evidence["first_finish_ready_step"] = control_state.first_finish_ready_step
+    stage_evidence["confirmed_finish_ready_step"] = control_state.confirmed_finish_ready_step
+    stage_evidence["confirmed_finish_ready_reason"] = control_state.confirmed_finish_ready_reason
+    stage_evidence["early_finish_confirm_policy"] = control_state.early_finish_confirm_policy
+    stage_evidence["finish_near_count"] = 0
+    stage_evidence["finish_visible_count"] = 0
+    stage_evidence["finish_centered_count"] = 0
+    stage_evidence["finish_lost_count"] = 0
+    stage_evidence["finish_complete_count"] = 0
+    stage_evidence["finish_window_visible_count"] = 0
+    stage_evidence["finish_window_reliable_count"] = 0
+    stage_evidence["finish_window_near_complete_count"] = 0
+    stage_evidence["finish_window_approaching_count"] = 0
+    stage_evidence["finish_window_centered_count"] = 0
+    stage_evidence["finish_window_close_count"] = 0
+    stage_evidence["finish_window_stop_ready_count"] = 0
+
+
+def _sync_finish_tracker(stage_tracker, control_state):
+    if stage_tracker is None:
+        return
+    stage_tracker.finish_mode_enter_step = control_state.finish_mode_enter_step
+    stage_tracker.finish_mode_exit_step = control_state.finish_mode_exit_step
+    stage_tracker.finish_mode_exit_reason = control_state.finish_mode_exit_reason
+    stage_tracker.finish_mode_reset_count = control_state.finish_mode_reset_count
+    stage_tracker.finish_mode_invalidated = control_state.finish_mode_invalidated
+    stage_tracker.finish_mode_consecutive_not_ready_count = control_state.finish_mode_consecutive_not_ready_count
+    stage_tracker.finish_mode_consecutive_approaching_count = control_state.finish_mode_consecutive_approaching_count
+    stage_tracker.finish_mode_consecutive_stop_not_ready_count = control_state.finish_mode_consecutive_stop_not_ready_count
+    stage_tracker.first_finish_ready_step = control_state.first_finish_ready_step
+    stage_tracker.finish_ready_reason = control_state.finish_ready_reason
+    stage_tracker.finish_ready_streak = control_state.finish_ready_streak
+    stage_tracker.finish_ready_streak_required = control_state.finish_ready_streak_required
+    stage_tracker.confirmed_finish_ready_step = control_state.confirmed_finish_ready_step
+    stage_tracker.confirmed_finish_ready_reason = control_state.confirmed_finish_ready_reason
+    stage_tracker.early_finish_confirm_policy = control_state.early_finish_confirm_policy
+    stage_tracker.finish_ready_blocked_reason = control_state.finish_ready_blocked_reason
+
+
+def _stage_motion_hint_required(expected_group):
+    return expected_group in {"left", "right"}
+
+
+def _mark_stage_motion_hint_satisfied(
+    control_state,
+    active_stage,
+    step_id,
+    reason,
+    by_action=False,
+    by_choice=False,
+    by_override=False,
+):
+    if control_state.stage_motion_hint_satisfied_by_stage.get(active_stage):
+        return
+    control_state.stage_motion_hint_satisfied_by_stage[active_stage] = True
+    control_state.stage_motion_hint_satisfied_step_by_stage[active_stage] = step_id
+    control_state.stage_motion_hint_satisfied_reason_by_stage[active_stage] = reason
+    control_state.stage_motion_hint_satisfied_by_action_by_stage[active_stage] = by_action
+    control_state.stage_motion_hint_satisfied_by_choice_by_stage[active_stage] = by_choice
+    control_state.stage_motion_hint_satisfied_by_override_by_stage[active_stage] = by_override
+
+
+def _apply_stage_motion_hint_fields(
+    stage_evidence,
+    control_state,
+    stage_tracker,
+    active_stage,
+    expected_group,
+    step_id,
+):
+    required_for_finish = _stage_motion_hint_required(expected_group)
+    if required_for_finish:
+        satisfied = bool(control_state.stage_motion_hint_satisfied_by_stage.get(active_stage, False))
+        satisfied_step = control_state.stage_motion_hint_satisfied_step_by_stage.get(active_stage, "")
+        satisfied_reason = control_state.stage_motion_hint_satisfied_reason_by_stage.get(active_stage, "")
+        satisfied_by_action = bool(control_state.stage_motion_hint_satisfied_by_action_by_stage.get(active_stage, False))
+        satisfied_by_choice = bool(control_state.stage_motion_hint_satisfied_by_choice_by_stage.get(active_stage, False))
+        satisfied_by_override = bool(control_state.stage_motion_hint_satisfied_by_override_by_stage.get(active_stage, False))
+    else:
+        satisfied = True
+        satisfied_step = step_id
+        satisfied_reason = "not_required"
+        satisfied_by_action = False
+        satisfied_by_choice = False
+        satisfied_by_override = False
+
+    stage_evidence["stage_motion_hint_expected_group"] = expected_group
+    stage_evidence["stage_motion_hint_required_for_finish"] = required_for_finish
+    stage_evidence["stage_motion_hint_satisfied"] = satisfied
+    stage_evidence["stage_motion_hint_satisfied_step"] = satisfied_step
+    stage_evidence["stage_motion_hint_satisfied_reason"] = satisfied_reason
+    stage_evidence["stage_motion_hint_satisfied_by_action"] = satisfied_by_action
+    stage_evidence["stage_motion_hint_satisfied_by_choice"] = satisfied_by_choice
+    stage_evidence["stage_motion_hint_satisfied_by_override"] = satisfied_by_override
+
+    if stage_tracker is not None:
+        stage_tracker.stage_motion_hint_expected_group = expected_group
+        stage_tracker.stage_motion_hint_required_for_finish = required_for_finish
+        stage_tracker.stage_motion_hint_satisfied = satisfied
+        stage_tracker.stage_motion_hint_satisfied_step = satisfied_step
+        stage_tracker.stage_motion_hint_satisfied_reason = satisfied_reason
+        stage_tracker.stage_motion_hint_satisfied_by_action = satisfied_by_action
+        stage_tracker.stage_motion_hint_satisfied_by_choice = satisfied_by_choice
+        stage_tracker.stage_motion_hint_satisfied_by_override = satisfied_by_override
+
+
+def _exit_finish_mode(control_state, stage_tracker, stage_evidence, step_id, reason):
+    control_state.finish_mode = False
+    control_state.finish_mode_exit_step = step_id
+    control_state.finish_mode_exit_reason = reason
+    control_state.finish_mode_reset_count += 1
+    control_state.finish_mode_invalidated = True
+    control_state.finish_mode_consecutive_not_ready_count = 0
+    control_state.finish_mode_consecutive_approaching_count = 0
+    control_state.finish_mode_consecutive_stop_not_ready_count = 0
+    control_state.finish_recent = []
+    control_state.finish_ready_streak = 0
+    control_state.finish_ready_blocked_reason = reason
+    stage_evidence["finish_mode"] = False
+    stage_evidence["finish_ready_candidate"] = False
+    stage_evidence["finish_mode_exit_step"] = step_id
+    stage_evidence["finish_mode_exit_reason"] = reason
+    stage_evidence["finish_mode_reset_count"] = control_state.finish_mode_reset_count
+    stage_evidence["finish_mode_invalidated"] = True
+    stage_evidence["finish_ready_streak"] = 0
+    stage_evidence["finish_ready_blocked_reason"] = reason
+    _sync_finish_tracker(stage_tracker, control_state)
+    print(f"[MEMORY_CONTROL] finish_mode exit step={step_id} reason={reason}")
+
+
+def apply_memory_control(args, step_id, model_action, ours_info, stage_evidence, stage_plan, stage_tracker, control_state):
+    stage_evidence = stage_evidence or {}
+    if not args.enable_memory_control:
+        return model_action, False, False
+
+    active_stage = stage_evidence.get("active_stage", stage_tracker.active_stage if stage_tracker else 0)
+    expected_group, actual_group, motion_conflict = fill_motion_hint_fields(
+        ours_info,
+        stage_evidence,
+        stage_plan,
+    )
+    confidence = float(ours_info.get("confidence", 0.0) or 0.0)
+    target_close = bool(stage_evidence.get("active_stage_target_close", False))
+    stage_progress = stage_evidence.get("stage_progress", "")
+    stop_ready = bool(stage_evidence.get("stop_ready_candidate", False))
+    stage_complete_candidate = bool(stage_evidence.get("stage_complete_candidate", False))
+    is_last_stage = bool(stage_plan) and int(active_stage) == len(stage_plan) - 1
+    control_state.reset_stage_if_needed(active_stage)
+    stage_first_step = None
+    if stage_tracker is not None:
+        stage_stats = stage_tracker.stage_stats.get(active_stage, {})
+        stage_first_step = stage_stats.get("stage_first_reliable_step")
+    stage_age = 0 if stage_first_step is None else max(0, step_id - stage_first_step)
+    cooldown = max(0, control_state.motion_hint_override_cooldown_by_stage.get(active_stage, 0))
+    if cooldown > 0:
+        cooldown -= 1
+        control_state.motion_hint_override_cooldown_by_stage[active_stage] = cooldown
+    stage_override_count = control_state.motion_hint_override_count_by_stage.get(active_stage, 0)
+    if motion_conflict and actual_group == "center":
+        control_state.motion_hint_conflict_streak_by_stage[active_stage] = (
+            control_state.motion_hint_conflict_streak_by_stage.get(active_stage, 0) + 1
+        )
+    else:
+        control_state.motion_hint_conflict_streak_by_stage[active_stage] = 0
+    if int(model_action) == 1:
+        control_state.motion_hint_forward_streak_by_stage[active_stage] = (
+            control_state.motion_hint_forward_streak_by_stage.get(active_stage, 0) + 1
+        )
+    else:
+        control_state.motion_hint_forward_streak_by_stage[active_stage] = 0
+    conflict_streak = control_state.motion_hint_conflict_streak_by_stage.get(active_stage, 0)
+    forward_streak = control_state.motion_hint_forward_streak_by_stage.get(active_stage, 0)
+
+    _set_finish_evidence_defaults(stage_evidence, control_state, step_id)
+    _apply_stage_motion_hint_fields(
+        stage_evidence,
+        control_state,
+        stage_tracker,
+        active_stage,
+        expected_group,
+        step_id,
+    )
+    stage_evidence["early_finish_blocked_reason"] = ""
+    stage_evidence["motion_hint_original_action_id"] = model_action
+    stage_evidence["motion_hint_original_action_name"] = action_id_to_name(model_action)
+    stage_evidence["motion_hint_corrected_action_id"] = ""
+    stage_evidence["motion_hint_corrected_action_name"] = ""
+    stage_evidence["motion_hint_override_count"] = stage_override_count
+    stage_evidence["motion_hint_override_cooldown"] = cooldown
+    stage_evidence["last_motion_hint_override_step"] = control_state.last_motion_hint_override_step_by_stage.get(active_stage, "")
+    stage_evidence["motion_hint_override_direction"] = ""
+    stage_evidence["motion_hint_override_blocked_reason"] = ""
+
+    if motion_conflict:
+        print(
+            f"[MOTION_HINT] conflict step={step_id} expected={expected_group} "
+            f"actual={actual_group} applied=false"
+        )
+
+    if bool(stage_evidence.get("active_stage_target_visible", False)):
+        if actual_group:
+            control_state.last_visible_choice_group_by_stage[active_stage] = actual_group
+        control_state.lost_count = 0
+        control_state.lost_recovery_streak = 0
+    else:
+        observed_stage_id = int(ours_info.get("observed_stage_id", -1) or -1)
+        if (
+            stage_progress == "lost"
+            or confidence <= 0.5
+            or observed_stage_id == -1
+        ):
+            control_state.lost_count += 1
+        else:
+            control_state.lost_count = 0
+
+    stage_evidence["lost_recovery_mode"] = False
+    stage_evidence["lost_recovery_reason"] = ""
+    stage_evidence["lost_recovery_count"] = control_state.lost_recovery_count
+    stage_evidence["lost_recovery_action"] = ""
+    stage_evidence["lost_recovery_direction"] = ""
+    stage_evidence["lost_recovery_source"] = ""
+    stage_evidence["control_override_used"] = False
+    stage_evidence["control_override_reason"] = ""
+
+    if (
+        not stop_ready
+        and control_state.lost_count >= 2
+        and control_state.lost_recovery_streak < 3
+        and (confidence <= 0.5 or int(ours_info.get("observed_stage_id", -1) or -1) == -1)
+    ):
+        direction = control_state.last_visible_choice_group_by_stage.get(active_stage, "")
+        source = "last_visible_choice_group"
+        if direction not in {"left", "right"}:
+            hint = active_stage_motion_hint(stage_plan, active_stage)
+            if "left" in hint and "right" not in hint:
+                direction = "left"
+                source = "motion_hint"
+            elif "right" in hint and "left" not in hint:
+                direction = "right"
+                source = "motion_hint"
+        if direction not in {"left", "right"}:
+            direction = "left" if control_state.last_search_direction == "right" else "right"
+            source = "alternating_search"
+        override_action = turn_action_for_group(direction)
+        if override_action is not None and model_action == 1:
+            model_action = override_action
+            control_state.lost_recovery_count += 1
+            control_state.lost_recovery_streak += 1
+            control_state.last_search_direction = direction
+            control_state.control_override_count += 1
+            stage_evidence["lost_recovery_mode"] = True
+            stage_evidence["lost_recovery_reason"] = "active_stage_target_lost"
+            stage_evidence["lost_recovery_count"] = control_state.lost_recovery_count
+            stage_evidence["lost_recovery_action"] = action_id_to_name(model_action)
+            stage_evidence["lost_recovery_direction"] = direction
+            stage_evidence["lost_recovery_source"] = source
+            stage_evidence["control_override_used"] = True
+            stage_evidence["control_override_reason"] = "lost_recovery"
+            print(f"[MEMORY_CONTROL] lost_recovery step={step_id} direction={direction} reason=active_stage_target_lost")
+
+    motion_hint_blocked_reason = ""
+    if motion_conflict and expected_group in {"left", "right"} and actual_group == "center":
+        if stage_evidence.get("control_override_used"):
+            motion_hint_blocked_reason = "higher_priority_override"
+        elif int(model_action) != 1:
+            motion_hint_blocked_reason = "non_forward_action"
+        elif target_close or stage_progress == "near" or stage_complete_candidate:
+            motion_hint_blocked_reason = "target_near_or_close"
+        elif stop_ready or stage_evidence.get("finish_mode") or stage_evidence.get("finish_ready_candidate"):
+            motion_hint_blocked_reason = "finish_mode_active"
+        elif bool(ours_info.get("fallback_used", False)) or confidence < 0.85:
+            motion_hint_blocked_reason = "low_confidence"
+        elif stage_override_count >= 2:
+            motion_hint_blocked_reason = "stage_override_limit"
+        elif cooldown > 0:
+            motion_hint_blocked_reason = "cooldown_active"
+        elif stage_age > 3 and (conflict_streak < 2 or forward_streak < 2):
+            motion_hint_blocked_reason = "needs_repeated_conflict"
+    if (
+        not motion_hint_blocked_reason
+        and not stage_evidence.get("control_override_used")
+        and motion_conflict
+        and expected_group in {"left", "right"}
+        and actual_group == "center"
+        and int(model_action) == 1
+        and not target_close
+        and stage_progress != "near"
+        and not stage_complete_candidate
+        and not stop_ready
+        and not stage_evidence.get("finish_mode")
+        and not stage_evidence.get("finish_ready_candidate")
+        and not bool(ours_info.get("fallback_used", False))
+        and confidence >= 0.85
+        and stage_override_count < 2
+        and cooldown == 0
+        and (stage_age <= 3 or (conflict_streak >= 2 and forward_streak >= 2))
+    ):
+        override_action = turn_action_for_group(expected_group)
+        if override_action is not None and model_action != override_action:
+            old_choice = ours_info.get("choice", "")
+            original_action = model_action
+            model_action = override_action
+            control_state.control_override_count += 1
+            control_state.motion_hint_override_count_by_stage[active_stage] = stage_override_count + 1
+            control_state.motion_hint_override_recent_by_stage[active_stage] = (
+                control_state.motion_hint_override_recent_by_stage.get(active_stage, 0) + 1
+            )
+            control_state.motion_hint_override_cooldown_by_stage[active_stage] = 2
+            control_state.last_motion_hint_override_step_by_stage[active_stage] = step_id
+            stage_evidence["motion_hint_control_applied"] = True
+            stage_evidence["motion_hint_control_reason"] = "stage_motion_hint_direction"
+            stage_evidence["motion_hint_corrected_action_id"] = model_action
+            stage_evidence["motion_hint_corrected_action_name"] = action_id_to_name(model_action)
+            stage_evidence["motion_hint_override_count"] = stage_override_count + 1
+            stage_evidence["motion_hint_override_cooldown"] = 2
+            stage_evidence["last_motion_hint_override_step"] = step_id
+            stage_evidence["motion_hint_override_direction"] = expected_group
+            stage_evidence["control_override_used"] = True
+            stage_evidence["control_override_reason"] = "motion_hint_direction_correction"
+            stage_evidence["memory_control_action"] = action_id_to_name(model_action)
+            stage_evidence["memory_control_reason"] = "motion_hint_direction_correction"
+            _mark_stage_motion_hint_satisfied(
+                control_state,
+                active_stage,
+                step_id,
+                "matched_motion_hint_override",
+                by_override=True,
+            )
+            _apply_stage_motion_hint_fields(
+                stage_evidence,
+                control_state,
+                stage_tracker,
+                active_stage,
+                expected_group,
+                step_id,
+            )
+            print(
+                f"[MOTION_HINT] override step={step_id} expected={expected_group} "
+                f"old_choice={old_choice} old_action={action_id_to_name(original_action)} "
+                f"new_action={action_id_to_name(model_action)}"
+            )
+        elif override_action is None:
+            stage_evidence["motion_hint_override_blocked_reason"] = "turn_action_mapping_missing"
+    elif motion_hint_blocked_reason:
+        stage_evidence["motion_hint_override_blocked_reason"] = motion_hint_blocked_reason
+
+    stage_motion_hint_required = bool(stage_evidence.get("stage_motion_hint_required_for_finish", False))
+    stage_motion_hint_satisfied = bool(stage_evidence.get("stage_motion_hint_satisfied", True))
+    finish_mode_unsatisfied_motion_hint = (
+        stage_evidence.get("finish_mode")
+        and is_last_stage
+        and stage_motion_hint_required
+        and not stage_motion_hint_satisfied
+        and motion_conflict
+        and expected_group in {"left", "right"}
+        and actual_group == "center"
+        and int(model_action) == 1
+        and not bool(ours_info.get("fallback_used", False))
+        and confidence >= 0.85
+        and stage_override_count < 2
+        and cooldown == 0
+        and not stage_evidence.get("finish_ready_candidate")
+    )
+    if finish_mode_unsatisfied_motion_hint and not stage_evidence.get("control_override_used"):
+        override_action = turn_action_for_group(expected_group)
+        if override_action is not None:
+            original_action = model_action
+            model_action = override_action
+            control_state.control_override_count += 1
+            control_state.motion_hint_override_count_by_stage[active_stage] = stage_override_count + 1
+            control_state.motion_hint_override_recent_by_stage[active_stage] = (
+                control_state.motion_hint_override_recent_by_stage.get(active_stage, 0) + 1
+            )
+            control_state.motion_hint_override_cooldown_by_stage[active_stage] = 2
+            control_state.last_motion_hint_override_step_by_stage[active_stage] = step_id
+            stage_evidence["motion_hint_control_applied"] = True
+            stage_evidence["motion_hint_control_reason"] = "finish_mode_unsatisfied_motion_hint"
+            stage_evidence["motion_hint_corrected_action_id"] = model_action
+            stage_evidence["motion_hint_corrected_action_name"] = action_id_to_name(model_action)
+            stage_evidence["motion_hint_override_count"] = stage_override_count + 1
+            stage_evidence["motion_hint_override_cooldown"] = 2
+            stage_evidence["last_motion_hint_override_step"] = step_id
+            stage_evidence["motion_hint_override_direction"] = expected_group
+            stage_evidence["motion_hint_override_blocked_reason"] = ""
+            stage_evidence["control_override_used"] = True
+            stage_evidence["control_override_reason"] = "finish_mode_motion_hint_correction"
+            stage_evidence["memory_control_action"] = action_id_to_name(model_action)
+            stage_evidence["memory_control_reason"] = "finish_mode_motion_hint_correction"
+            _mark_stage_motion_hint_satisfied(
+                control_state,
+                active_stage,
+                step_id,
+                "matched_motion_hint_override",
+                by_override=True,
+            )
+            _apply_stage_motion_hint_fields(
+                stage_evidence,
+                control_state,
+                stage_tracker,
+                active_stage,
+                expected_group,
+                step_id,
+            )
+            print(
+                f"[MOTION_HINT] finish_mode override step={step_id} expected={expected_group} "
+                f"old_action={action_id_to_name(original_action)} new_action={action_id_to_name(model_action)}"
+            )
+
+    if _stage_motion_hint_required(expected_group):
+        if action_id_to_name(model_action) == f"turn_{expected_group}_30":
+            _mark_stage_motion_hint_satisfied(
+                control_state,
+                active_stage,
+                step_id,
+                "matched_turn_action",
+                by_action=True,
+            )
+        elif actual_group == expected_group:
+            _mark_stage_motion_hint_satisfied(
+                control_state,
+                active_stage,
+                step_id,
+                "matched_choice_group",
+                by_choice=True,
+            )
+        _apply_stage_motion_hint_fields(
+            stage_evidence,
+            control_state,
+            stage_tracker,
+            active_stage,
+            expected_group,
+            step_id,
+        )
+
+    if stop_ready:
+        if is_last_stage and args.memory_control_stop_mode in {"record_only", "early_finish"}:
+            if not control_state.finish_mode:
+                control_state.finish_mode = True
+                control_state.finish_mode_enter_step = step_id
+                control_state.finish_mode_invalidated = False
+                control_state.finish_mode_consecutive_not_ready_count = 0
+                control_state.finish_mode_consecutive_approaching_count = 0
+                control_state.finish_mode_consecutive_stop_not_ready_count = 0
+                control_state.finish_recent = []
+                control_state.finish_ready_streak = 0
+                control_state.finish_ready_blocked_reason = "finish_age_too_small"
+                stage_evidence["finish_mode"] = True
+                stage_evidence["finish_mode_enter_step"] = step_id
+                stage_evidence["finish_mode_age"] = 0
+                stage_evidence["finish_mode_reason"] = "stop_ready_candidate"
+                if stage_tracker is not None:
+                    _sync_finish_tracker(stage_tracker, control_state)
+                print(f"[MEMORY_CONTROL] finish_mode enter step={step_id} reason=stop_ready_candidate")
+        if args.memory_control_stop_mode == "stop_action":
+            print(
+                f"[MEMORY_CONTROL] stop_action requested step={step_id}, "
+                "but no explicit stop action is applied; recording only"
+            )
+        else:
+            print(f"[MEMORY_CONTROL] stop_ready_candidate step={step_id} reason=record_only")
+
+    if control_state.finish_mode:
+        reliable = not bool(ours_info.get("fallback_used", False)) and confidence >= 0.8
+        control_state.finish_recent.append(
+            {
+                "visible": bool(stage_evidence.get("active_stage_target_visible", False)),
+                "centered": bool(stage_evidence.get("active_stage_target_centered", False)),
+                "close": bool(stage_evidence.get("active_stage_target_close", False)),
+                "near_or_complete": (
+                    stage_progress == "near"
+                    or bool(stage_evidence.get("active_stage_target_close", False))
+                    or bool(stage_evidence.get("stage_complete_candidate", False))
+                ),
+                "approaching": stage_progress == "approaching",
+                "lost": stage_progress == "lost",
+                "complete": bool(stage_evidence.get("stage_complete_candidate", False)),
+                "stop_ready": stop_ready,
+                "reliable": reliable,
+                "finish_ready": False,
+            }
+        )
+        control_state.finish_recent = control_state.finish_recent[-12:]
+        finish_mode_age = step_id - control_state.finish_mode_enter_step
+        stats = _finish_window_stats(control_state.finish_recent, window_size=12)
+        visible_count = stats["visible_count"]
+        centered_count = stats["centered_count"]
+        near_count = stats["near_complete_count"]
+        lost_count = stats["lost_count"]
+        complete_count = stats["complete_count"]
+        stop_ready_count = stats["stop_ready_count"]
+        reliable_count = stats["reliable_count"]
+        approaching_count = stats["approaching_count"]
+        close_count = stats["close_count"]
+        stage_evidence["finish_mode"] = True
+        stage_evidence["finish_mode_enter_step"] = control_state.finish_mode_enter_step
+        stage_evidence["finish_mode_age"] = finish_mode_age
+        stage_evidence["finish_near_count"] = near_count
+        stage_evidence["finish_visible_count"] = visible_count
+        stage_evidence["finish_centered_count"] = centered_count
+        stage_evidence["finish_lost_count"] = lost_count
+        stage_evidence["finish_complete_count"] = complete_count
+        stage_evidence["finish_window_visible_count"] = visible_count
+        stage_evidence["finish_window_reliable_count"] = reliable_count
+        stage_evidence["finish_window_near_complete_count"] = near_count
+        stage_evidence["finish_window_approaching_count"] = approaching_count
+        stage_evidence["finish_window_centered_count"] = centered_count
+        stage_evidence["finish_window_close_count"] = close_count
+        stage_evidence["finish_window_stop_ready_count"] = stop_ready_count
+
+        stage_motion_hint_required = bool(stage_evidence.get("stage_motion_hint_required_for_finish", False))
+        stage_motion_hint_satisfied = bool(stage_evidence.get("stage_motion_hint_satisfied", True))
+        motion_hint_blocks_finish = bool(
+            is_last_stage and stage_motion_hint_required and not stage_motion_hint_satisfied
+        )
+        blocked_reason = ""
+        if motion_hint_blocks_finish:
+            blocked_reason = "motion_hint_not_satisfied"
+        elif finish_mode_age < 20:
+            blocked_reason = "finish_age_too_small"
+        elif len(control_state.finish_recent) < 12:
+            blocked_reason = "insufficient_window_length"
+        elif visible_count < 10:
+            blocked_reason = "insufficient_visible_count"
+        elif reliable_count < 10:
+            blocked_reason = "insufficient_reliable_count"
+        elif lost_count > 0:
+            blocked_reason = "lost_in_window"
+        elif near_count < 9:
+            blocked_reason = "insufficient_near_complete_count"
+        elif approaching_count > 2:
+            blocked_reason = "too_many_approaching_steps"
+        elif centered_count < 8:
+            blocked_reason = "insufficient_centered_count"
+        elif close_count < 7:
+            blocked_reason = "insufficient_close_count"
+        elif stop_ready_count < 9:
+            blocked_reason = "insufficient_stop_ready_count"
+
+        finish_ready = blocked_reason == ""
+        if finish_ready:
+            stage_evidence["finish_ready_candidate"] = True
+            stage_evidence["finish_ready_reason"] = "stable_finish_window_strict"
+            stage_evidence["finish_ready_step"] = step_id
+            stage_evidence["finish_ready_blocked_reason"] = ""
+            stage_evidence["memory_control_action"] = "finish_ready_candidate"
+            stage_evidence["memory_control_reason"] = "stable_finish_window_strict"
+            control_state.finish_ready_streak += 1
+            control_state.finish_ready_blocked_reason = ""
+            control_state.finish_recent[-1]["finish_ready"] = True
+            if control_state.first_finish_ready_step == "":
+                control_state.first_finish_ready_step = step_id
+                control_state.finish_ready_reason = "stable_finish_window_strict"
+            if stage_tracker is not None and stage_tracker.first_finish_ready_step == "":
+                stage_tracker.first_finish_ready_step = step_id
+                stage_tracker.finish_ready_reason = "stable_finish_window_strict"
+            if stage_tracker is not None:
+                stage_tracker.early_finish_blocked_reason = ""
+            print(f"[MEMORY_CONTROL] finish_ready_candidate step={step_id} mode={args.memory_control_stop_mode}")
+        else:
+            stage_evidence["finish_ready_candidate"] = False
+            stage_evidence["finish_ready_blocked_reason"] = blocked_reason
+            if blocked_reason == "motion_hint_not_satisfied":
+                stage_evidence["early_finish_blocked_reason"] = "motion_hint_not_satisfied"
+                if stage_tracker is not None:
+                    stage_tracker.early_finish_blocked_reason = "motion_hint_not_satisfied"
+            control_state.finish_ready_streak = 0
+            control_state.finish_ready_blocked_reason = blocked_reason
+
+        if not finish_ready:
+            control_state.finish_mode_consecutive_not_ready_count += 1
+        else:
+            control_state.finish_mode_consecutive_not_ready_count = 0
+        if not stop_ready:
+            control_state.finish_mode_consecutive_stop_not_ready_count += 1
+        else:
+            control_state.finish_mode_consecutive_stop_not_ready_count = 0
+        if stage_progress == "approaching" and not stage_complete_candidate and not finish_ready:
+            control_state.finish_mode_consecutive_approaching_count += 1
+        else:
+            control_state.finish_mode_consecutive_approaching_count = 0
+
+        stage_evidence["finish_ready_streak"] = control_state.finish_ready_streak
+        stage_evidence["finish_ready_streak_required"] = control_state.finish_ready_streak_required
+        stage_evidence["early_finish_confirm_policy"] = control_state.early_finish_confirm_policy
+        stage_evidence["first_finish_ready_step"] = control_state.first_finish_ready_step
+        stage_evidence["finish_mode_consecutive_not_ready_count"] = control_state.finish_mode_consecutive_not_ready_count
+        stage_evidence["finish_mode_consecutive_approaching_count"] = control_state.finish_mode_consecutive_approaching_count
+        stage_evidence["finish_mode_consecutive_stop_not_ready_count"] = control_state.finish_mode_consecutive_stop_not_ready_count
+
+        exit_reason = ""
+        unstable_window_ready = len(control_state.finish_recent) >= 8
+        unstable_stats = _finish_window_stats(control_state.finish_recent, window_size=8)
+        unstable_visible = unstable_stats["visible_count"]
+        unstable_near = unstable_stats["near_complete_count"]
+        recent_ready_count = unstable_stats["finish_ready_count"]
+        if (
+            control_state.finish_mode_consecutive_stop_not_ready_count >= 4
+            and not finish_ready
+        ):
+            exit_reason = "stop_ready_lost"
+        elif control_state.finish_mode_consecutive_approaching_count >= 4:
+            exit_reason = "progress_back_to_approaching"
+        elif unstable_window_ready and (unstable_visible < 5 or unstable_near < 4):
+            exit_reason = "finish_evidence_unstable"
+        elif (
+            finish_mode_age > 35
+            and not bool(stage_tracker.early_finish_by_memory if stage_tracker is not None else False)
+            and unstable_window_ready
+            and recent_ready_count == 0
+        ):
+            exit_reason = "finish_mode_timeout_without_ready"
+
+        if exit_reason:
+            _exit_finish_mode(control_state, stage_tracker, stage_evidence, step_id, exit_reason)
+            return model_action, False, False
+
+        confirmed_ready = (
+            finish_ready
+            and not motion_hint_blocks_finish
+            and control_state.finish_ready_streak >= CONFIRMED_FINISH_READY_STREAK
+            and finish_mode_age >= 24
+            and lost_count == 0
+            and approaching_count <= 2
+            and close_count >= 7
+            and complete_count >= 7
+            and visible_count >= 10
+        )
+        if confirmed_ready:
+            confirmed_reason = f"confirmed_finish_ready_streak_{CONFIRMED_FINISH_READY_STREAK}"
+            if control_state.confirmed_finish_ready_step == "":
+                control_state.confirmed_finish_ready_step = step_id
+                control_state.confirmed_finish_ready_reason = confirmed_reason
+            stage_evidence["confirmed_finish_ready_step"] = control_state.confirmed_finish_ready_step
+            stage_evidence["confirmed_finish_ready_reason"] = control_state.confirmed_finish_ready_reason
+            if stage_tracker is not None:
+                stage_tracker.confirmed_finish_ready_step = control_state.confirmed_finish_ready_step
+                stage_tracker.confirmed_finish_ready_reason = control_state.confirmed_finish_ready_reason
+            print(f"[MEMORY_CONTROL] confirmed_finish_ready step={step_id} streak={control_state.finish_ready_streak}")
+            if args.memory_control_stop_mode == "early_finish":
+                if stage_tracker is not None:
+                    stage_tracker.early_finish_by_memory = True
+                    stage_tracker.early_finish_step = step_id
+                    stage_tracker.early_finish_reason = confirmed_reason
+                print(f"[MEMORY_CONTROL] early_finish step={step_id} reason={confirmed_reason}")
+                return model_action, True, True
+        _sync_finish_tracker(stage_tracker, control_state)
+
+    return model_action, False, False
 
 
 def maybe_add_memory_node(
@@ -1166,6 +2255,82 @@ def maybe_add_memory_node(
         long_approach_confirmed_count=stage_evidence.get("long_approach_confirmed_count", ""),
         consecutive_tracker_completion_count=stage_evidence.get("consecutive_tracker_completion_count", ""),
         consecutive_long_approach_confirmed_count=stage_evidence.get("consecutive_long_approach_confirmed_count", ""),
+        final_stage_completion_candidate=stage_evidence.get("final_stage_completion_candidate", ""),
+        task_complete_candidate=stage_evidence.get("task_complete_candidate", ""),
+        task_complete_reason=stage_evidence.get("task_complete_reason", ""),
+        task_complete_step=stage_evidence.get("task_complete_step", ""),
+        task_complete_confidence=stage_evidence.get("task_complete_confidence", ""),
+        stop_ready_candidate=stage_evidence.get("stop_ready_candidate", ""),
+        stop_ready_reason=stage_evidence.get("stop_ready_reason", ""),
+        stop_ready_step=stage_evidence.get("stop_ready_step", ""),
+        stop_ready_confidence=stage_evidence.get("stop_ready_confidence", ""),
+        stop_ready_count=stage_evidence.get("stop_ready_count", ""),
+        memory_control_action=stage_evidence.get("memory_control_action", ""),
+        memory_control_reason=stage_evidence.get("memory_control_reason", ""),
+        lost_recovery_mode=stage_evidence.get("lost_recovery_mode", ""),
+        lost_recovery_reason=stage_evidence.get("lost_recovery_reason", ""),
+        lost_recovery_count=stage_evidence.get("lost_recovery_count", ""),
+        lost_recovery_action=stage_evidence.get("lost_recovery_action", ""),
+        lost_recovery_direction=stage_evidence.get("lost_recovery_direction", ""),
+        lost_recovery_source=stage_evidence.get("lost_recovery_source", ""),
+        control_override_used=stage_evidence.get("control_override_used", ""),
+        control_override_reason=stage_evidence.get("control_override_reason", ""),
+        motion_hint_expected_group=stage_evidence.get("motion_hint_expected_group", ""),
+        motion_hint_actual_group=stage_evidence.get("motion_hint_actual_group", ""),
+        motion_hint_conflict=stage_evidence.get("motion_hint_conflict", ""),
+        motion_hint_control_applied=stage_evidence.get("motion_hint_control_applied", ""),
+        motion_hint_control_reason=stage_evidence.get("motion_hint_control_reason", ""),
+        motion_hint_original_action_id=stage_evidence.get("motion_hint_original_action_id", ""),
+        motion_hint_original_action_name=stage_evidence.get("motion_hint_original_action_name", ""),
+        motion_hint_corrected_action_id=stage_evidence.get("motion_hint_corrected_action_id", ""),
+        motion_hint_corrected_action_name=stage_evidence.get("motion_hint_corrected_action_name", ""),
+        motion_hint_override_count=stage_evidence.get("motion_hint_override_count", ""),
+        motion_hint_override_cooldown=stage_evidence.get("motion_hint_override_cooldown", ""),
+        last_motion_hint_override_step=stage_evidence.get("last_motion_hint_override_step", ""),
+        motion_hint_override_direction=stage_evidence.get("motion_hint_override_direction", ""),
+        motion_hint_override_blocked_reason=stage_evidence.get("motion_hint_override_blocked_reason", ""),
+        finish_mode=stage_evidence.get("finish_mode", ""),
+        finish_mode_enter_step=stage_evidence.get("finish_mode_enter_step", ""),
+        finish_mode_age=stage_evidence.get("finish_mode_age", ""),
+        finish_mode_reason=stage_evidence.get("finish_mode_reason", ""),
+        finish_mode_exit_step=stage_evidence.get("finish_mode_exit_step", ""),
+        finish_mode_exit_reason=stage_evidence.get("finish_mode_exit_reason", ""),
+        finish_mode_reset_count=stage_evidence.get("finish_mode_reset_count", ""),
+        finish_mode_invalidated=stage_evidence.get("finish_mode_invalidated", ""),
+        finish_mode_consecutive_not_ready_count=stage_evidence.get("finish_mode_consecutive_not_ready_count", ""),
+        finish_mode_consecutive_approaching_count=stage_evidence.get("finish_mode_consecutive_approaching_count", ""),
+        finish_mode_consecutive_stop_not_ready_count=stage_evidence.get("finish_mode_consecutive_stop_not_ready_count", ""),
+        finish_ready_candidate=stage_evidence.get("finish_ready_candidate", ""),
+        finish_ready_reason=stage_evidence.get("finish_ready_reason", ""),
+        finish_ready_step=stage_evidence.get("finish_ready_step", ""),
+        finish_ready_blocked_reason=stage_evidence.get("finish_ready_blocked_reason", ""),
+        finish_ready_streak=stage_evidence.get("finish_ready_streak", ""),
+        finish_ready_streak_required=stage_evidence.get("finish_ready_streak_required", ""),
+        first_finish_ready_step=stage_evidence.get("first_finish_ready_step", ""),
+        confirmed_finish_ready_step=stage_evidence.get("confirmed_finish_ready_step", ""),
+        confirmed_finish_ready_reason=stage_evidence.get("confirmed_finish_ready_reason", ""),
+        early_finish_confirm_policy=stage_evidence.get("early_finish_confirm_policy", ""),
+        finish_near_count=stage_evidence.get("finish_near_count", ""),
+        finish_visible_count=stage_evidence.get("finish_visible_count", ""),
+        finish_centered_count=stage_evidence.get("finish_centered_count", ""),
+        finish_lost_count=stage_evidence.get("finish_lost_count", ""),
+        finish_complete_count=stage_evidence.get("finish_complete_count", ""),
+        finish_window_visible_count=stage_evidence.get("finish_window_visible_count", ""),
+        finish_window_reliable_count=stage_evidence.get("finish_window_reliable_count", ""),
+        finish_window_near_complete_count=stage_evidence.get("finish_window_near_complete_count", ""),
+        finish_window_approaching_count=stage_evidence.get("finish_window_approaching_count", ""),
+        finish_window_centered_count=stage_evidence.get("finish_window_centered_count", ""),
+        finish_window_close_count=stage_evidence.get("finish_window_close_count", ""),
+        finish_window_stop_ready_count=stage_evidence.get("finish_window_stop_ready_count", ""),
+        stage_motion_hint_expected_group=stage_evidence.get("stage_motion_hint_expected_group", ""),
+        stage_motion_hint_required_for_finish=stage_evidence.get("stage_motion_hint_required_for_finish", ""),
+        stage_motion_hint_satisfied=stage_evidence.get("stage_motion_hint_satisfied", ""),
+        stage_motion_hint_satisfied_step=stage_evidence.get("stage_motion_hint_satisfied_step", ""),
+        stage_motion_hint_satisfied_reason=stage_evidence.get("stage_motion_hint_satisfied_reason", ""),
+        stage_motion_hint_satisfied_by_action=stage_evidence.get("stage_motion_hint_satisfied_by_action", ""),
+        stage_motion_hint_satisfied_by_choice=stage_evidence.get("stage_motion_hint_satisfied_by_choice", ""),
+        stage_motion_hint_satisfied_by_override=stage_evidence.get("stage_motion_hint_satisfied_by_override", ""),
+        early_finish_blocked_reason=stage_evidence.get("early_finish_blocked_reason", ""),
         close_memory_active=stage_evidence.get("close_memory_active", ""),
         close_memory_age=stage_evidence.get("close_memory_age", ""),
         close_memory_source=stage_evidence.get("close_memory_source", ""),
@@ -1222,7 +2387,12 @@ def maybe_add_memory_node(
         f"pose=({pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f}), "
         f"choice={selected_choice}, action={action_id}"
     )
-    save_memory_graph(graph, output_dir, stage_plan=stage_plan, stage_tracker=stage_tracker)
+    save_memory_graph(
+        graph,
+        output_dir,
+        stage_plan=stage_plan,
+        stage_tracker=stage_tracker,
+    )
     return node
 
 def get_action(policy, processor, image_list, text, his, if_his=False, his_step=0):
@@ -1298,13 +2468,29 @@ def getPoseAfterMakeAction(new_pose, action):
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--agent_type", choices=["openfly", "ours"], default="openfly")
-    parser.add_argument("--ours_base_url", default="http://127.0.0.1:8000/v1")
+    default_airsim_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "envs", "airsim")
+    )
+    parser.add_argument("--airsim_root", default=default_airsim_root)
+    parser.add_argument("--airsim_port", type=int, default=41452)
+    parser.add_argument("--airsim_startup_timeout", type=float, default=60.0)
+    parser.add_argument("--airsim_rpc_timeout", type=float, default=30.0)
+    parser.add_argument("--ours_base_url", default="http://127.0.0.1:8001/v1")
     parser.add_argument("--ours_model", default="qwen3.6-27b")
+    parser.add_argument("--ours_request_timeout", type=float, default=180.0)
     parser.add_argument("--ours_output_dir", default="./ours_eval_outputs")
+    parser.add_argument("--stage_parser", choices=["rule", "qwen"], default="rule")
     parser.add_argument("--max_envs", type=int, default=None)
+    parser.add_argument("--start_sample", type=int, default=0)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--enable_memory_record", type=parse_bool, default=True)
+    parser.add_argument("--enable_memory_control", type=parse_bool, default=False)
+    parser.add_argument(
+        "--memory_control_stop_mode",
+        choices=["record_only", "early_finish", "stop_action"],
+        default="record_only",
+    )
     parser.add_argument("--memory_sample_dist", type=float, default=12.0)
     parser.add_argument("--memory_sample_yaw_deg", type=float, default=35.0)
     parser.add_argument("--memory_revisit_dist", type=float, default=8.0)
@@ -1335,10 +2521,12 @@ def main():
         ).to("cuda:0")
     else:
         os.makedirs(args.ours_output_dir, exist_ok=True)
+        print(f"[OURS] base_url={args.ours_base_url} model={args.ours_model}")
         ours_agent = OurSPFAgent(
             base_url=args.ours_base_url,
             model_name=args.ours_model,
             output_dir=args.ours_output_dir,
+            request_timeout=args.ours_request_timeout,
         )
         csv_file = open(os.path.join(args.ours_output_dir, "ours_steps.csv"), "a", newline="")
         csv_writer = csv.DictWriter(
@@ -1376,6 +2564,71 @@ def main():
                 "active_stage_target_passed",
                 "stage_progress",
                 "stage_complete_candidate",
+                "stop_ready_candidate",
+                "memory_control_action",
+                "memory_control_reason",
+                "lost_recovery_mode",
+                "lost_recovery_action",
+                "control_override_used",
+                "control_override_reason",
+                "motion_hint_expected_group",
+                "motion_hint_actual_group",
+                "motion_hint_conflict",
+                "motion_hint_control_applied",
+                "motion_hint_control_reason",
+                "motion_hint_original_action_id",
+                "motion_hint_original_action_name",
+                "motion_hint_corrected_action_id",
+                "motion_hint_corrected_action_name",
+                "motion_hint_override_count",
+                "motion_hint_override_cooldown",
+                "last_motion_hint_override_step",
+                "motion_hint_override_direction",
+                "motion_hint_override_blocked_reason",
+                "finish_mode",
+                "finish_mode_enter_step",
+                "finish_mode_age",
+                "finish_mode_exit_step",
+                "finish_mode_exit_reason",
+                "finish_mode_reset_count",
+                "finish_mode_invalidated",
+                "finish_mode_consecutive_not_ready_count",
+                "finish_mode_consecutive_approaching_count",
+                "finish_mode_consecutive_stop_not_ready_count",
+                "finish_ready_candidate",
+                "finish_ready_reason",
+                "finish_ready_step",
+                "finish_ready_blocked_reason",
+                "finish_ready_streak",
+                "finish_ready_streak_required",
+                "first_finish_ready_step",
+                "confirmed_finish_ready_step",
+                "confirmed_finish_ready_reason",
+                "early_finish_confirm_policy",
+                "finish_near_count",
+                "finish_visible_count",
+                "finish_centered_count",
+                "finish_lost_count",
+                "finish_complete_count",
+                "finish_window_visible_count",
+                "finish_window_reliable_count",
+                "finish_window_near_complete_count",
+                "finish_window_approaching_count",
+                "finish_window_centered_count",
+                "finish_window_close_count",
+                "finish_window_stop_ready_count",
+                "stage_motion_hint_expected_group",
+                "stage_motion_hint_required_for_finish",
+                "stage_motion_hint_satisfied",
+                "stage_motion_hint_satisfied_step",
+                "stage_motion_hint_satisfied_reason",
+                "stage_motion_hint_satisfied_by_action",
+                "stage_motion_hint_satisfied_by_choice",
+                "stage_motion_hint_satisfied_by_override",
+                "early_finish_by_memory",
+                "early_finish_reason",
+                "early_finish_blocked_reason",
+                "early_finish_step",
             ],
         )
         if csv_file.tell() == 0:
@@ -1407,7 +2660,13 @@ def main():
         
         # Create appropriate environment bridge based on environment type
         if "airsim" in env_name:
-            env_bridge = AirsimBridge(env_name)
+            env_bridge = AirsimBridge(
+                env_name,
+                args.airsim_root,
+                args.airsim_port,
+                args.airsim_startup_timeout,
+                args.airsim_rpc_timeout,
+            )
             pos_ratio = 1.0
         elif "ue" in env_name:
             env_bridge = UEBridge(ue_ip="127.0.0.1", ue_port="9000", env_name=env_name)
@@ -1419,11 +2678,14 @@ def main():
             print(f"Unknown environment type: {env_name}, skipping")
             continue
         
-        # Evaluate all data for current environment
-        if args.max_samples is not None:
-            eval_info = eval_info[:args.max_samples]
+        # Evaluate a sample range for current environment.
+        if args.start_sample < 0:
+            raise ValueError(f"--start_sample must be >= 0, got {args.start_sample}")
+        sample_start = args.start_sample
+        sample_end = None if args.max_samples is None else sample_start + args.max_samples
+        eval_info = eval_info[sample_start:sample_end]
 
-        for idx, item in enumerate(eval_info):
+        for idx, item in enumerate(eval_info, start=sample_start):
             acts = []  # Reset action list
             
             pos_list = item['pos']
@@ -1448,9 +2710,19 @@ def main():
             last_stage_evidence = None
             last_model_action = None
             last_step_id = None
+            control_state = MemoryControlState()
+            early_stop_by_memory = False
+            early_stop_reason = ""
             if args.agent_type == "ours" and args.enable_memory_record:
                 memory_dir = memory_output_dir(args.ours_output_dir, env_name, idx)
-                stage_plan = extract_stage_plan(text)
+                stage_plan, _stage_parser_meta = parse_stage_plan(
+                    text,
+                    base_url=args.ours_base_url,
+                    model_name=args.ours_model,
+                    parser_type=args.stage_parser,
+                    timeout=180,
+                    max_tokens=900,
+                )
                 if stage_plan:
                     stage_plan[0]["status"] = "active"
                 stage_tracker = StageMemoryTracker(stage_plan)
@@ -1505,6 +2777,34 @@ def main():
                         stage_evidence = None
                         if stage_tracker is not None:
                             stage_evidence = stage_tracker.update(step, ours_info)
+                        if stage_evidence is not None:
+                            fill_motion_hint_fields(ours_info, stage_evidence, stage_plan)
+                        memory_finish = False
+                        if stage_evidence is not None:
+                            model_action, memory_finish, early_stop_by_memory = apply_memory_control(
+                                args,
+                                step,
+                                model_action,
+                                ours_info,
+                                stage_evidence,
+                                stage_plan,
+                                stage_tracker,
+                                control_state,
+                            )
+                            if early_stop_by_memory:
+                                early_stop_reason = (
+                                    stage_evidence.get("confirmed_finish_ready_reason")
+                                    or f"confirmed_finish_ready_streak_{CONFIRMED_FINISH_READY_STREAK}"
+                                )
+                            if args.memory_control_stop_mode == "stop_action" and memory_finish:
+                                print("[MEMORY_CONTROL] stop_action requested but no explicit stop action is used in this mode")
+                            distance_to_goal = calculate_distance(end_position, pose_before[:3])
+                            if stage_tracker is not None:
+                                stage_tracker.record_step_context(
+                                    stage_evidence,
+                                    action_name=action_id_to_name(model_action),
+                                    distance_to_goal=distance_to_goal,
+                                )
                         if memory_graph is not None:
                             maybe_add_memory_node(
                                 graph=memory_graph,
@@ -1560,6 +2860,71 @@ def main():
                                 "active_stage_target_passed": ours_info.get("active_stage_target_passed", ""),
                                 "stage_progress": ours_info.get("stage_progress", ""),
                                 "stage_complete_candidate": ours_info.get("stage_complete_candidate", ""),
+                                "stop_ready_candidate": stage_evidence.get("stop_ready_candidate", "") if stage_evidence else "",
+                                "memory_control_action": stage_evidence.get("memory_control_action", "") if stage_evidence else "",
+                                "memory_control_reason": stage_evidence.get("memory_control_reason", "") if stage_evidence else "",
+                                "lost_recovery_mode": stage_evidence.get("lost_recovery_mode", "") if stage_evidence else "",
+                                "lost_recovery_action": stage_evidence.get("lost_recovery_action", "") if stage_evidence else "",
+                                "control_override_used": stage_evidence.get("control_override_used", "") if stage_evidence else "",
+                                "control_override_reason": stage_evidence.get("control_override_reason", "") if stage_evidence else "",
+                                "motion_hint_expected_group": stage_evidence.get("motion_hint_expected_group", "") if stage_evidence else "",
+                                "motion_hint_actual_group": stage_evidence.get("motion_hint_actual_group", "") if stage_evidence else "",
+                                "motion_hint_conflict": stage_evidence.get("motion_hint_conflict", "") if stage_evidence else "",
+                                "motion_hint_control_applied": stage_evidence.get("motion_hint_control_applied", "") if stage_evidence else "",
+                                "motion_hint_control_reason": stage_evidence.get("motion_hint_control_reason", "") if stage_evidence else "",
+                                "motion_hint_original_action_id": stage_evidence.get("motion_hint_original_action_id", "") if stage_evidence else "",
+                                "motion_hint_original_action_name": stage_evidence.get("motion_hint_original_action_name", "") if stage_evidence else "",
+                                "motion_hint_corrected_action_id": stage_evidence.get("motion_hint_corrected_action_id", "") if stage_evidence else "",
+                                "motion_hint_corrected_action_name": stage_evidence.get("motion_hint_corrected_action_name", "") if stage_evidence else "",
+                                "motion_hint_override_count": stage_evidence.get("motion_hint_override_count", "") if stage_evidence else "",
+                                "motion_hint_override_cooldown": stage_evidence.get("motion_hint_override_cooldown", "") if stage_evidence else "",
+                                "last_motion_hint_override_step": stage_evidence.get("last_motion_hint_override_step", "") if stage_evidence else "",
+                                "motion_hint_override_direction": stage_evidence.get("motion_hint_override_direction", "") if stage_evidence else "",
+                                "motion_hint_override_blocked_reason": stage_evidence.get("motion_hint_override_blocked_reason", "") if stage_evidence else "",
+                                "finish_mode": stage_evidence.get("finish_mode", "") if stage_evidence else "",
+                                "finish_mode_enter_step": stage_evidence.get("finish_mode_enter_step", "") if stage_evidence else "",
+                                "finish_mode_age": stage_evidence.get("finish_mode_age", "") if stage_evidence else "",
+                                "finish_mode_exit_step": stage_evidence.get("finish_mode_exit_step", "") if stage_evidence else "",
+                                "finish_mode_exit_reason": stage_evidence.get("finish_mode_exit_reason", "") if stage_evidence else "",
+                                "finish_mode_reset_count": stage_evidence.get("finish_mode_reset_count", "") if stage_evidence else "",
+                                "finish_mode_invalidated": stage_evidence.get("finish_mode_invalidated", "") if stage_evidence else "",
+                                "finish_mode_consecutive_not_ready_count": stage_evidence.get("finish_mode_consecutive_not_ready_count", "") if stage_evidence else "",
+                                "finish_mode_consecutive_approaching_count": stage_evidence.get("finish_mode_consecutive_approaching_count", "") if stage_evidence else "",
+                                "finish_mode_consecutive_stop_not_ready_count": stage_evidence.get("finish_mode_consecutive_stop_not_ready_count", "") if stage_evidence else "",
+                                "finish_ready_candidate": stage_evidence.get("finish_ready_candidate", "") if stage_evidence else "",
+                                "finish_ready_reason": stage_evidence.get("finish_ready_reason", "") if stage_evidence else "",
+                                "finish_ready_step": stage_evidence.get("finish_ready_step", "") if stage_evidence else "",
+                                "finish_ready_blocked_reason": stage_evidence.get("finish_ready_blocked_reason", "") if stage_evidence else "",
+                                "finish_ready_streak": stage_evidence.get("finish_ready_streak", "") if stage_evidence else "",
+                                "finish_ready_streak_required": stage_evidence.get("finish_ready_streak_required", "") if stage_evidence else "",
+                                "first_finish_ready_step": stage_evidence.get("first_finish_ready_step", "") if stage_evidence else "",
+                                "confirmed_finish_ready_step": stage_evidence.get("confirmed_finish_ready_step", "") if stage_evidence else "",
+                                "confirmed_finish_ready_reason": stage_evidence.get("confirmed_finish_ready_reason", "") if stage_evidence else "",
+                                "early_finish_confirm_policy": stage_evidence.get("early_finish_confirm_policy", "") if stage_evidence else "",
+                                "finish_near_count": stage_evidence.get("finish_near_count", "") if stage_evidence else "",
+                                "finish_visible_count": stage_evidence.get("finish_visible_count", "") if stage_evidence else "",
+                                "finish_centered_count": stage_evidence.get("finish_centered_count", "") if stage_evidence else "",
+                                "finish_lost_count": stage_evidence.get("finish_lost_count", "") if stage_evidence else "",
+                                "finish_complete_count": stage_evidence.get("finish_complete_count", "") if stage_evidence else "",
+                                "finish_window_visible_count": stage_evidence.get("finish_window_visible_count", "") if stage_evidence else "",
+                                "finish_window_reliable_count": stage_evidence.get("finish_window_reliable_count", "") if stage_evidence else "",
+                                "finish_window_near_complete_count": stage_evidence.get("finish_window_near_complete_count", "") if stage_evidence else "",
+                                "finish_window_approaching_count": stage_evidence.get("finish_window_approaching_count", "") if stage_evidence else "",
+                                "finish_window_centered_count": stage_evidence.get("finish_window_centered_count", "") if stage_evidence else "",
+                                "finish_window_close_count": stage_evidence.get("finish_window_close_count", "") if stage_evidence else "",
+                                "finish_window_stop_ready_count": stage_evidence.get("finish_window_stop_ready_count", "") if stage_evidence else "",
+                                "stage_motion_hint_expected_group": stage_evidence.get("stage_motion_hint_expected_group", "") if stage_evidence else "",
+                                "stage_motion_hint_required_for_finish": stage_evidence.get("stage_motion_hint_required_for_finish", "") if stage_evidence else "",
+                                "stage_motion_hint_satisfied": stage_evidence.get("stage_motion_hint_satisfied", "") if stage_evidence else "",
+                                "stage_motion_hint_satisfied_step": stage_evidence.get("stage_motion_hint_satisfied_step", "") if stage_evidence else "",
+                                "stage_motion_hint_satisfied_reason": stage_evidence.get("stage_motion_hint_satisfied_reason", "") if stage_evidence else "",
+                                "stage_motion_hint_satisfied_by_action": stage_evidence.get("stage_motion_hint_satisfied_by_action", "") if stage_evidence else "",
+                                "stage_motion_hint_satisfied_by_choice": stage_evidence.get("stage_motion_hint_satisfied_by_choice", "") if stage_evidence else "",
+                                "stage_motion_hint_satisfied_by_override": stage_evidence.get("stage_motion_hint_satisfied_by_override", "") if stage_evidence else "",
+                                "early_finish_by_memory": early_stop_by_memory,
+                                "early_finish_reason": early_stop_reason,
+                                "early_finish_blocked_reason": stage_evidence.get("early_finish_blocked_reason", "") if stage_evidence else "",
+                                "early_finish_step": step if early_stop_by_memory else "",
                             }
                         )
                         csv_file.flush()
@@ -1576,6 +2941,10 @@ def main():
                     )
                     
                     if model_action == 0:
+                        stop_error = 0
+                        break
+                    if early_stop_by_memory:
+                        print(f"[MEMORY_CONTROL] graceful early finish sample={idx} step={step} reason={early_stop_reason}")
                         stop_error = 0
                         break
                     step += 1
@@ -1604,6 +2973,7 @@ def main():
                     "raw_response": "",
                     "input_image_path": "",
                     "selected_image_path": "",
+                    "confidence": "",
                 }
                 maybe_add_memory_node(
                     graph=memory_graph,

@@ -101,6 +101,12 @@ def true_node_refs(nodes, field):
                     node.get("consecutive_long_approach_confirmed_count", ""),
                     default=0,
                 ),
+                "final_stage_completion_candidate": to_bool(
+                    node.get("final_stage_completion_candidate", "")
+                ),
+                "task_complete_reason": node.get("task_complete_reason", ""),
+                "task_complete_step": to_int(node.get("task_complete_step", ""), default=-1),
+                "task_complete_confidence": to_float(node.get("task_complete_confidence", "")),
                 "fallback_used": to_bool(node.get("fallback_used", "")),
             }
         )
@@ -114,6 +120,14 @@ def analyze(graph_dir):
     graph_json = load_json(graph_dir / "memory_graph.json", {})
     if not nodes and graph_json:
         nodes = graph_json.get("nodes", [])
+    sample_id = graph_json.get("sample_id", "")
+    steps_path = graph_dir.parents[2] / "ours_steps.csv" if len(graph_dir.parents) >= 3 else None
+    step_rows = []
+    if steps_path is not None and steps_path.exists():
+        step_rows = [
+            row for row in load_csv(steps_path)
+            if str(row.get("sample_id", "")) == str(sample_id)
+        ]
 
     transitions = stage_memory.get("transitions", [])
     observed_ids = [to_int(node.get("observed_stage_id", "")) for node in nodes]
@@ -137,6 +151,38 @@ def analyze(graph_dir):
     close_memory_values = bool_series(nodes, "close_memory_active")
     long_approach_values = bool_series(nodes, "long_approach_candidate")
     long_approach_confirmed_values = bool_series(nodes, "long_approach_confirmed")
+    task_complete_values = bool_series(nodes, "task_complete_candidate")
+    stop_ready_values = bool_series(nodes, "stop_ready_candidate")
+    finish_ready_values = bool_series(nodes, "finish_ready_candidate")
+    finish_mode_values = bool_series(nodes, "finish_mode")
+    finish_ready_blocked_reasons = Counter(
+        node.get("finish_ready_blocked_reason", "")
+        for node in nodes
+        if node.get("finish_ready_blocked_reason", "")
+    )
+    early_finish_blocked_reasons = Counter(
+        node.get("early_finish_blocked_reason", "")
+        for node in nodes
+        if node.get("early_finish_blocked_reason", "")
+    )
+    lost_recovery_values = bool_series(nodes, "lost_recovery_mode")
+    control_override_values = bool_series(nodes, "control_override_used")
+    motion_hint_conflict_values = bool_series(nodes, "motion_hint_conflict")
+    last_stage_id = len(stage_plan) - 1
+    final_stage_nodes = [
+        node for node in nodes
+        if to_int(node.get("active_stage", ""), default=-1) == last_stage_id
+    ]
+    final_stage_expected_group_distribution = Counter(
+        node.get("stage_motion_hint_expected_group", node.get("motion_hint_expected_group", ""))
+        for node in final_stage_nodes
+        if node.get("stage_motion_hint_expected_group", node.get("motion_hint_expected_group", ""))
+    )
+    final_stage_actual_group_distribution = Counter(
+        node.get("motion_hint_actual_group", "")
+        for node in final_stage_nodes
+        if node.get("motion_hint_actual_group", "")
+    )
     reliable_visible_by_stage = defaultdict(list)
     for node in reliable_nodes:
         active_stage = to_int(node.get("active_stage", ""))
@@ -349,6 +395,144 @@ def analyze(graph_dir):
     long_approach_strong_without_transition = bool(
         long_approach_confirmed_strong_nodes and not long_approach_transition_details
     )
+    task_complete_candidate = to_bool(stage_memory.get("task_complete_candidate", False))
+    stop_ready_candidate = to_bool(stage_memory.get("stop_ready_candidate", False))
+    final_completion_reasons = {
+        "close_count",
+        "smoothed_close_memory",
+        "vlm_complete_count",
+        "long_approach_confirmed",
+    }
+    final_stage_strong_nodes = [
+        {
+            "node_id": to_int(node.get("node_id", "")),
+            "step_id": to_int(node.get("step_id", "")),
+            "active_stage": to_int(node.get("active_stage", "")),
+            "tracker_completion_reason": node.get("tracker_completion_reason", ""),
+            "consecutive_tracker_completion_count": to_int(
+                node.get("consecutive_tracker_completion_count", ""),
+                default=0,
+            ),
+            "confidence": to_float(node.get("confidence", "")),
+        }
+        for node in nodes
+        if to_int(node.get("active_stage", "")) == last_stage_id
+        and to_bool(node.get("stage_completion_candidate_by_tracker", ""))
+        and node.get("tracker_completion_reason", "") in final_completion_reasons
+        and to_int(node.get("consecutive_tracker_completion_count", ""), default=0) >= 2
+    ]
+    warning_final_stage_strong_without_task_complete = bool(
+        final_stage_strong_nodes and not task_complete_candidate
+    )
+    post_task_complete_distance_delta = to_float(stage_memory.get("post_task_complete_distance_delta", ""))
+    warning_distance_increased_after_task_complete = (
+        task_complete_candidate and post_task_complete_distance_delta > 10.0
+    )
+    lost_forward_nodes = [
+        {
+            "node_id": to_int(node.get("node_id", "")),
+            "step_id": to_int(node.get("step_id", "")),
+            "action_name": node.get("action_name", ""),
+            "confidence": to_float(node.get("confidence", "")),
+            "stage_progress": node.get("stage_progress", ""),
+        }
+        for node in nodes
+        if node.get("action_name") == "forward_3"
+        and (
+            node.get("stage_progress") == "lost"
+            or not to_bool(node.get("active_stage_target_visible", node.get("stage_target_visible", "")))
+        )
+    ]
+    warning_lost_but_forward = bool(lost_forward_nodes)
+    stop_ready_forward_steps = [
+        to_int(row.get("step_id", ""))
+        for row in step_rows
+        if to_bool(row.get("stop_ready_candidate", ""))
+        and row.get("action_name", "") == "forward_3"
+    ]
+    first_finish_ready_step_value = to_int(stage_memory.get("first_finish_ready_step", ""), default=-1)
+    confirmed_finish_ready_step_value = to_int(stage_memory.get("confirmed_finish_ready_step", ""), default=-1)
+    early_finish_step_value = to_int(stage_memory.get("early_finish_step", ""), default=-1)
+    finish_ready_to_confirm_steps = (
+        confirmed_finish_ready_step_value - first_finish_ready_step_value
+        if first_finish_ready_step_value >= 0 and confirmed_finish_ready_step_value >= 0
+        else ""
+    )
+    finish_ready_to_early_finish_steps = (
+        early_finish_step_value - first_finish_ready_step_value
+        if first_finish_ready_step_value >= 0 and early_finish_step_value >= 0
+        else ""
+    )
+    finish_ready_forward_steps = [
+        to_int(row.get("step_id", ""))
+        for row in step_rows
+        if first_finish_ready_step_value >= 0
+        and to_int(row.get("step_id", ""), default=-1) >= first_finish_ready_step_value
+        and row.get("action_name", "") == "forward_3"
+    ]
+    confirmed_finish_forward_steps = [
+        to_int(row.get("step_id", ""))
+        for row in step_rows
+        if confirmed_finish_ready_step_value >= 0
+        and to_int(row.get("step_id", ""), default=-1) >= confirmed_finish_ready_step_value
+        and row.get("action_name", "") == "forward_3"
+    ]
+    warning_stop_ready_forward_many = len(stop_ready_forward_steps) > 8
+    warning_finish_mode_long_no_early_finish = (
+        longest_true_run(finish_mode_values) > 30
+        and not to_bool(stage_memory.get("early_finish_by_memory", False))
+    )
+    warning_early_finish_confirmation_too_conservative = (
+        isinstance(finish_ready_to_early_finish_steps, int)
+        and finish_ready_to_early_finish_steps >= 4
+    )
+    warning_early_finish_without_motion_hint = (
+        to_bool(stage_memory.get("early_finish_by_memory", False))
+        and to_bool(stage_memory.get("stage_motion_hint_required_for_finish", False))
+        and not to_bool(stage_memory.get("stage_motion_hint_satisfied", True))
+    )
+    motion_hint_missing_rows = [
+        {
+            "step_id": to_int(row.get("step_id", "")),
+            "expected": row.get("motion_hint_expected_group", ""),
+            "actual": row.get("motion_hint_actual_group", ""),
+        }
+        for row in step_rows
+        if row.get("motion_hint_expected_group", "") and not row.get("motion_hint_actual_group", "")
+    ]
+    warning_motion_hint_fields_missing = bool(motion_hint_missing_rows)
+    action_values = [node.get("action_name", "") for node in nodes]
+    action_counts = Counter(action_values)
+    action_total = len([action for action in action_values if action])
+    forward_action_count = action_counts.get("forward_3", 0)
+    turn_left_action_count = action_counts.get("turn_left_30", 0)
+    turn_right_action_count = action_counts.get("turn_right_30", 0)
+    forward_ratio = forward_action_count / action_total if action_total else 0.0
+    motion_hint_override_nodes = [
+        {
+            "node_id": to_int(node.get("node_id", "")),
+            "step_id": to_int(node.get("step_id", "")),
+            "direction": node.get("motion_hint_override_direction", ""),
+            "original_action": node.get("motion_hint_original_action_name", ""),
+            "corrected_action": node.get("motion_hint_corrected_action_name", ""),
+        }
+        for node in nodes
+        if to_bool(node.get("motion_hint_control_applied", ""))
+    ]
+    motion_hint_override_blocked_reasons = Counter(
+        node.get("motion_hint_override_blocked_reason", "")
+        for node in nodes
+        if node.get("motion_hint_override_blocked_reason", "")
+    )
+    stage_has_lr_hint = any(
+        "left" in str(stage.get("motion_hint", "")).lower()
+        or "right" in str(stage.get("motion_hint", "")).lower()
+        for stage in stage_plan
+    )
+    warning_motion_hint_conflict_no_override = (
+        sum(motion_hint_conflict_values) > 0 and not motion_hint_override_nodes
+    )
+    warning_forward_dominated_with_lr_hint = forward_ratio > 0.9 and stage_has_lr_hint
     weak_transition_warnings = [
         transition
         for transition in transitions
@@ -412,6 +596,115 @@ def analyze(graph_dir):
             "final_active_stage": stage_memory.get("active_stage"),
             "transitions": transitions,
             "no_stage_transition_detected": len(transitions) == 0,
+        },
+        "task_complete_check": {
+            "task_complete_candidate": task_complete_candidate,
+            "task_complete_step": stage_memory.get("task_complete_step", ""),
+            "task_complete_reason": stage_memory.get("task_complete_reason", ""),
+            "task_complete_confidence": stage_memory.get("task_complete_confidence", ""),
+            "final_stage_completion_count": stage_memory.get("final_stage_completion_count", 0),
+            "stop_ready_candidate": stop_ready_candidate,
+            "stop_ready_step": stage_memory.get("stop_ready_step", ""),
+            "stop_ready_reason": stage_memory.get("stop_ready_reason", ""),
+            "stop_ready_confidence": stage_memory.get("stop_ready_confidence", ""),
+            "stop_ready_count": stage_memory.get("stop_ready_count", 0),
+            "first_task_complete_step": stage_memory.get("first_task_complete_step", ""),
+            "first_stop_ready_step": stage_memory.get("first_stop_ready_step", ""),
+            "post_task_complete_steps": stage_memory.get("post_task_complete_steps", 0),
+            "post_task_complete_lost_count": stage_memory.get("post_task_complete_lost_count", 0),
+            "post_task_complete_revisit_count": stage_memory.get("post_task_complete_revisit_count", 0),
+            "post_task_complete_action_counts": stage_memory.get("post_task_complete_action_counts", {}),
+            "post_task_complete_control_override_count": stage_memory.get("post_task_complete_control_override_count", 0),
+            "post_task_complete_distance_min": stage_memory.get("post_task_complete_distance_min", ""),
+            "post_task_complete_distance_last": stage_memory.get("post_task_complete_distance_last", ""),
+            "post_task_complete_distance_delta": stage_memory.get("post_task_complete_distance_delta", ""),
+            "warning_distance_increased_after_task_complete": warning_distance_increased_after_task_complete,
+            "node_true_count": sum(task_complete_values),
+            "nodes": true_node_refs(nodes, "task_complete_candidate"),
+            "stop_ready_node_true_count": sum(stop_ready_values),
+            "stop_ready_nodes": true_node_refs(nodes, "stop_ready_candidate"),
+            "first_stop_ready_step": stage_memory.get("first_stop_ready_step", ""),
+            "finish_mode_enter_step": stage_memory.get("finish_mode_enter_step", ""),
+            "finish_mode_exit_step": stage_memory.get("finish_mode_exit_step", ""),
+            "finish_mode_exit_reason": stage_memory.get("finish_mode_exit_reason", ""),
+            "finish_mode_reset_count": stage_memory.get("finish_mode_reset_count", 0),
+            "finish_mode_invalidated": stage_memory.get("finish_mode_invalidated", False),
+            "finish_mode_active_steps": sum(finish_mode_values),
+            "finish_mode_longest_run": longest_true_run(finish_mode_values),
+            "finish_mode_consecutive_not_ready_count": stage_memory.get("finish_mode_consecutive_not_ready_count", ""),
+            "finish_mode_consecutive_approaching_count": stage_memory.get("finish_mode_consecutive_approaching_count", ""),
+            "finish_mode_consecutive_stop_not_ready_count": stage_memory.get("finish_mode_consecutive_stop_not_ready_count", ""),
+            "first_finish_ready_step": stage_memory.get("first_finish_ready_step", ""),
+            "finish_ready_reason": stage_memory.get("finish_ready_reason", ""),
+            "finish_ready_streak": stage_memory.get("finish_ready_streak", 0),
+            "finish_ready_streak_required": stage_memory.get("finish_ready_streak_required", ""),
+            "finish_ready_blocked_reason": stage_memory.get("finish_ready_blocked_reason", ""),
+            "finish_ready_blocked_reason_distribution": dict(finish_ready_blocked_reasons),
+            "finish_ready_motion_hint_not_satisfied_count": finish_ready_blocked_reasons.get(
+                "motion_hint_not_satisfied",
+                0,
+            ),
+            "confirmed_finish_ready_step": stage_memory.get("confirmed_finish_ready_step", ""),
+            "confirmed_finish_ready_reason": stage_memory.get("confirmed_finish_ready_reason", ""),
+            "confirmed_finish_ready": bool(stage_memory.get("confirmed_finish_ready_step", "")),
+            "finish_ready_to_confirm_steps": finish_ready_to_confirm_steps,
+            "finish_ready_to_early_finish_steps": finish_ready_to_early_finish_steps,
+            "finish_ready_node_true_count": sum(finish_ready_values),
+            "finish_ready_nodes": true_node_refs(nodes, "finish_ready_candidate"),
+            "early_finish_by_memory": stage_memory.get("early_finish_by_memory", False),
+            "early_finish_step": stage_memory.get("early_finish_step", ""),
+            "early_finish_reason": stage_memory.get("early_finish_reason", ""),
+            "early_finish_confirm_policy": stage_memory.get("early_finish_confirm_policy", ""),
+            "early_finish_blocked_reason": stage_memory.get("early_finish_blocked_reason", ""),
+            "early_finish_blocked_reason_distribution": dict(early_finish_blocked_reasons),
+            "stage_motion_hint_expected_group": stage_memory.get("stage_motion_hint_expected_group", ""),
+            "stage_motion_hint_required_for_finish": stage_memory.get("stage_motion_hint_required_for_finish", False),
+            "stage_motion_hint_satisfied": stage_memory.get("stage_motion_hint_satisfied", True),
+            "stage_motion_hint_satisfied_step": stage_memory.get("stage_motion_hint_satisfied_step", ""),
+            "stage_motion_hint_satisfied_reason": stage_memory.get("stage_motion_hint_satisfied_reason", ""),
+            "stage_motion_hint_satisfied_by_action": stage_memory.get("stage_motion_hint_satisfied_by_action", False),
+            "stage_motion_hint_satisfied_by_choice": stage_memory.get("stage_motion_hint_satisfied_by_choice", False),
+            "stage_motion_hint_satisfied_by_override": stage_memory.get("stage_motion_hint_satisfied_by_override", False),
+            "final_stage_expected_group_distribution": dict(final_stage_expected_group_distribution),
+            "final_stage_actual_group_distribution": dict(final_stage_actual_group_distribution),
+            "post_stop_ready_steps": stage_memory.get("post_stop_ready_steps", 0),
+            "post_stop_ready_action_counts": stage_memory.get("post_stop_ready_action_counts", {}),
+            "stop_ready_forward_steps": stop_ready_forward_steps,
+            "stop_ready_forward_count": len(stop_ready_forward_steps),
+            "finish_ready_forward_steps": finish_ready_forward_steps,
+            "finish_ready_forward_count": len(finish_ready_forward_steps),
+            "confirmed_finish_forward_steps": confirmed_finish_forward_steps,
+            "confirmed_finish_forward_count": len(confirmed_finish_forward_steps),
+            "warning_stop_ready_forward_many": warning_stop_ready_forward_many,
+            "warning_finish_mode_long_no_early_finish": warning_finish_mode_long_no_early_finish,
+            "warning_early_finish_confirmation_too_conservative": warning_early_finish_confirmation_too_conservative,
+            "warning_early_finish_without_motion_hint": warning_early_finish_without_motion_hint,
+            "final_stage_strong_nodes": final_stage_strong_nodes,
+            "warning_final_stage_strong_without_task_complete": warning_final_stage_strong_without_task_complete,
+        },
+        "memory_control_check": {
+            "motion_hint_conflict_count": sum(motion_hint_conflict_values),
+            "motion_hint_override_count": len(motion_hint_override_nodes),
+            "motion_hint_override_applied_steps": [
+                node["step_id"] for node in motion_hint_override_nodes
+            ],
+            "motion_hint_override_directions": dict(
+                Counter(node["direction"] for node in motion_hint_override_nodes)
+            ),
+            "motion_hint_override_blocked_reasons": dict(motion_hint_override_blocked_reasons),
+            "warning_motion_hint_conflict_no_override": warning_motion_hint_conflict_no_override,
+            "lost_recovery_count": sum(lost_recovery_values),
+            "control_override_count": sum(control_override_values),
+            "forward_action_count": forward_action_count,
+            "turn_left_action_count": turn_left_action_count,
+            "turn_right_action_count": turn_right_action_count,
+            "forward_ratio": forward_ratio,
+            "warning_forward_dominated_with_lr_hint": warning_forward_dominated_with_lr_hint,
+            "lost_forward_count": len(lost_forward_nodes),
+            "lost_forward_nodes": lost_forward_nodes[:20],
+            "warning_lost_but_forward": warning_lost_but_forward,
+            "motion_hint_missing_rows": motion_hint_missing_rows[:20],
+            "warning_motion_hint_fields_missing": warning_motion_hint_fields_missing,
         },
         "observed_stage_check": {
             "distribution": dict(observed_distribution),
@@ -553,6 +846,184 @@ def build_summary(analysis):
         lines.append("- active_stage never changed; no stage transition was detected.")
     else:
         lines.append(f"- transitions: {analysis['active_stage_check']['transitions']}")
+    if analysis["task_complete_check"]["task_complete_candidate"]:
+        lines.append(
+            "- TASK COMPLETE CANDIDATE: yes "
+            f"step={analysis['task_complete_check']['task_complete_step']} "
+            f"reason={analysis['task_complete_check']['task_complete_reason']} "
+            f"confidence={analysis['task_complete_check']['task_complete_confidence']}"
+        )
+        lines.append(
+            "- STOP READY CANDIDATE: "
+            f"{'yes' if analysis['task_complete_check']['stop_ready_candidate'] else 'no'} "
+            f"step={analysis['task_complete_check']['stop_ready_step']} "
+            f"reason={analysis['task_complete_check']['stop_ready_reason']} "
+            f"count={analysis['task_complete_check']['stop_ready_count']}"
+        )
+        lines.append(
+            "- finish_mode: "
+            f"enter_step={analysis['task_complete_check']['finish_mode_enter_step']}, "
+            f"exit_step={analysis['task_complete_check']['finish_mode_exit_step']}, "
+            f"exit_reason={analysis['task_complete_check']['finish_mode_exit_reason']}, "
+            f"reset_count={analysis['task_complete_check']['finish_mode_reset_count']}, "
+            f"active_steps={analysis['task_complete_check']['finish_mode_active_steps']}, "
+            f"longest_run={analysis['task_complete_check']['finish_mode_longest_run']}, "
+            f"first_finish_ready_step={analysis['task_complete_check']['first_finish_ready_step']}, "
+            f"confirmed_finish_ready_step={analysis['task_complete_check']['confirmed_finish_ready_step']}, "
+            f"finish_ready_reason={analysis['task_complete_check']['finish_ready_reason']}, "
+            f"finish_ready_streak={analysis['task_complete_check']['finish_ready_streak']}, "
+            f"finish_ready_streak_required={analysis['task_complete_check']['finish_ready_streak_required']}, "
+            f"finish_ready_to_confirm_steps={analysis['task_complete_check']['finish_ready_to_confirm_steps']}, "
+            f"finish_ready_to_early_finish_steps={analysis['task_complete_check']['finish_ready_to_early_finish_steps']}, "
+            f"early_finish_confirm_policy={analysis['task_complete_check']['early_finish_confirm_policy']}, "
+            f"early_finish={analysis['task_complete_check']['early_finish_by_memory']} "
+            f"early_step={analysis['task_complete_check']['early_finish_step']}"
+        )
+        if analysis["task_complete_check"]["finish_ready_blocked_reason_distribution"]:
+            lines.append(
+                "- finish_ready_blocked_reasons: "
+                f"{analysis['task_complete_check']['finish_ready_blocked_reason_distribution']}"
+            )
+        if analysis["task_complete_check"]["early_finish_blocked_reason_distribution"]:
+            lines.append(
+                "- early_finish_blocked_reasons: "
+                f"{analysis['task_complete_check']['early_finish_blocked_reason_distribution']}"
+            )
+        lines.append(
+            "- final_stage_motion_hint: "
+            f"expected={analysis['task_complete_check']['stage_motion_hint_expected_group']}, "
+            f"required={analysis['task_complete_check']['stage_motion_hint_required_for_finish']}, "
+            f"satisfied={analysis['task_complete_check']['stage_motion_hint_satisfied']}, "
+            f"step={analysis['task_complete_check']['stage_motion_hint_satisfied_step']}, "
+            f"reason={analysis['task_complete_check']['stage_motion_hint_satisfied_reason']}, "
+            f"by_action={analysis['task_complete_check']['stage_motion_hint_satisfied_by_action']}, "
+            f"by_choice={analysis['task_complete_check']['stage_motion_hint_satisfied_by_choice']}, "
+            f"by_override={analysis['task_complete_check']['stage_motion_hint_satisfied_by_override']}"
+        )
+        lines.append(
+            "- final_stage_motion_hint_groups: "
+            f"expected={analysis['task_complete_check']['final_stage_expected_group_distribution']}, "
+            f"actual={analysis['task_complete_check']['final_stage_actual_group_distribution']}"
+        )
+        lines.append(
+            "- post_stop_ready: "
+            f"steps={analysis['task_complete_check']['post_stop_ready_steps']}, "
+            f"actions={analysis['task_complete_check']['post_stop_ready_action_counts']}"
+        )
+        if analysis["task_complete_check"]["warning_stop_ready_forward_many"]:
+            lines.append("- WARNING: stop_ready_candidate active but agent continued forward for many steps.")
+        lines.append(
+            "- forward_after_finish_signals: "
+            f"stop_ready_forward={analysis['task_complete_check']['stop_ready_forward_count']}, "
+            f"finish_ready_forward={analysis['task_complete_check']['finish_ready_forward_count']}, "
+            f"confirmed_finish_forward={analysis['task_complete_check']['confirmed_finish_forward_count']}"
+        )
+        if analysis["task_complete_check"]["warning_finish_mode_long_no_early_finish"]:
+            lines.append("- WARNING: finish_mode stayed active for many steps without early_finish.")
+        if analysis["task_complete_check"]["warning_early_finish_confirmation_too_conservative"]:
+            lines.append(
+                "- WARNING: early_finish confirmation may be too conservative; "
+                "agent continued too many steps after first finish_ready."
+            )
+        if analysis["task_complete_check"]["warning_early_finish_without_motion_hint"]:
+            lines.append("- WARNING: early_finish triggered without satisfying final-stage motion hint.")
+        lines.append(
+            "- post_task_complete: "
+            f"steps={analysis['task_complete_check']['post_task_complete_steps']}, "
+            f"lost={analysis['task_complete_check']['post_task_complete_lost_count']}, "
+            f"actions={analysis['task_complete_check']['post_task_complete_action_counts']}, "
+            f"distance_min={analysis['task_complete_check']['post_task_complete_distance_min']}, "
+            f"distance_last={analysis['task_complete_check']['post_task_complete_distance_last']}, "
+            f"delta={analysis['task_complete_check']['post_task_complete_distance_delta']}"
+        )
+        if analysis["task_complete_check"]["warning_distance_increased_after_task_complete"]:
+            lines.append(
+                "- WARNING: distance increased after task_complete_candidate; "
+                "completion may be too early or stop control is missing."
+            )
+    elif analysis["task_complete_check"]["warning_final_stage_strong_without_task_complete"]:
+        lines.append(
+            "- WARNING: final stage has repeated strong completion evidence "
+            "but no task_complete_candidate was recorded."
+        )
+        lines.append(
+            "- final stage strong nodes: "
+            f"{analysis['task_complete_check']['final_stage_strong_nodes']}"
+        )
+    if not analysis["task_complete_check"]["task_complete_candidate"]:
+        lines.append(
+            "- finish_control: "
+            f"enter_step={analysis['task_complete_check']['finish_mode_enter_step']}, "
+            f"exit_step={analysis['task_complete_check']['finish_mode_exit_step']}, "
+            f"exit_reason={analysis['task_complete_check']['finish_mode_exit_reason']}, "
+            f"reset_count={analysis['task_complete_check']['finish_mode_reset_count']}, "
+            f"active_steps={analysis['task_complete_check']['finish_mode_active_steps']}, "
+            f"longest_run={analysis['task_complete_check']['finish_mode_longest_run']}, "
+            f"first_finish_ready_step={analysis['task_complete_check']['first_finish_ready_step']}, "
+            f"confirmed_finish_ready_step={analysis['task_complete_check']['confirmed_finish_ready_step']}, "
+            f"finish_ready_streak={analysis['task_complete_check']['finish_ready_streak']}, "
+            f"finish_ready_streak_required={analysis['task_complete_check']['finish_ready_streak_required']}, "
+            f"finish_ready_to_confirm_steps={analysis['task_complete_check']['finish_ready_to_confirm_steps']}, "
+            f"finish_ready_to_early_finish_steps={analysis['task_complete_check']['finish_ready_to_early_finish_steps']}, "
+            f"early_finish_confirm_policy={analysis['task_complete_check']['early_finish_confirm_policy']}, "
+            f"early_finish={analysis['task_complete_check']['early_finish_by_memory']}"
+        )
+        if analysis["task_complete_check"]["finish_ready_blocked_reason_distribution"]:
+            lines.append(
+                "- finish_ready_blocked_reasons: "
+                f"{analysis['task_complete_check']['finish_ready_blocked_reason_distribution']}"
+            )
+        if analysis["task_complete_check"]["early_finish_blocked_reason_distribution"]:
+            lines.append(
+                "- early_finish_blocked_reasons: "
+                f"{analysis['task_complete_check']['early_finish_blocked_reason_distribution']}"
+            )
+        lines.append(
+            "- final_stage_motion_hint: "
+            f"expected={analysis['task_complete_check']['stage_motion_hint_expected_group']}, "
+            f"required={analysis['task_complete_check']['stage_motion_hint_required_for_finish']}, "
+            f"satisfied={analysis['task_complete_check']['stage_motion_hint_satisfied']}, "
+            f"step={analysis['task_complete_check']['stage_motion_hint_satisfied_step']}, "
+            f"reason={analysis['task_complete_check']['stage_motion_hint_satisfied_reason']}, "
+            f"expected_groups={analysis['task_complete_check']['final_stage_expected_group_distribution']}, "
+            f"actual_groups={analysis['task_complete_check']['final_stage_actual_group_distribution']}"
+        )
+        if analysis["task_complete_check"]["warning_finish_mode_long_no_early_finish"]:
+            lines.append("- WARNING: finish_mode stayed active for many steps without early_finish.")
+        if analysis["task_complete_check"]["warning_early_finish_confirmation_too_conservative"]:
+            lines.append(
+                "- WARNING: early_finish confirmation may be too conservative; "
+                "agent continued too many steps after first finish_ready."
+            )
+        if analysis["task_complete_check"]["warning_early_finish_without_motion_hint"]:
+            lines.append("- WARNING: early_finish triggered without satisfying final-stage motion hint.")
+    lines.append(
+        "- memory_control: "
+        f"motion_hint_conflict_count={analysis['memory_control_check']['motion_hint_conflict_count']}, "
+        f"motion_hint_override_count={analysis['memory_control_check']['motion_hint_override_count']}, "
+        f"lost_recovery_count={analysis['memory_control_check']['lost_recovery_count']}, "
+        f"control_override_count={analysis['memory_control_check']['control_override_count']}"
+    )
+    lines.append(
+        "- action_distribution: "
+        f"forward_3={analysis['memory_control_check']['forward_action_count']}, "
+        f"turn_left_30={analysis['memory_control_check']['turn_left_action_count']}, "
+        f"turn_right_30={analysis['memory_control_check']['turn_right_action_count']}, "
+        f"forward_ratio={analysis['memory_control_check']['forward_ratio']:.3f}"
+    )
+    if analysis["memory_control_check"]["motion_hint_override_blocked_reasons"]:
+        lines.append(
+            "- motion_hint_override_blocked_reasons: "
+            f"{analysis['memory_control_check']['motion_hint_override_blocked_reasons']}"
+        )
+    if analysis["memory_control_check"]["warning_motion_hint_conflict_no_override"]:
+        lines.append("- WARNING: motion_hint conflicts detected but no action override was applied.")
+    if analysis["memory_control_check"]["warning_forward_dominated_with_lr_hint"]:
+        lines.append("- WARNING: actions are dominated by forward_3 despite left/right motion hints.")
+    if analysis["memory_control_check"]["warning_lost_but_forward"]:
+        lines.append("- WARNING: target lost but forward action continued.")
+    if analysis["memory_control_check"]["warning_motion_hint_fields_missing"]:
+        lines.append("- WARNING: motion_hint fields missing in step log.")
     if analysis["complete_candidate_check"]["complete_never_triggered"]:
         lines.append("- stage_complete_candidate was never true.")
     if analysis["tracker_completion_candidate_check"]["true_count"] == 0:
