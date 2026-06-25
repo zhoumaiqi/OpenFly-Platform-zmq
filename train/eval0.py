@@ -2108,7 +2108,6 @@ def apply_memory_control(args, step_id, model_action, ours_info, stage_evidence,
             finish_ready
             and not motion_hint_blocks_finish
             and control_state.finish_ready_streak >= CONFIRMED_FINISH_READY_STREAK
-            and finish_mode_age >= 24
             and lost_count == 0
             and approaching_count <= 2
             and close_count >= 7
